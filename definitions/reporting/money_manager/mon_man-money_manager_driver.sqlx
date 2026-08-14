@@ -1,0 +1,377 @@
+config {
+    type: "table",
+    name: "money_manager_driver",
+    schema: "money_manager",
+    description: "Generates a main table to support various analytics functions that depend on financial transaction details as well as other tables that support the money manager application.",
+    tags: ["money_manager"],
+    bigquery: {
+        labels: {
+            scheduler: "dataform",
+            refresh: "hourly",
+            author: "Stakeholder"
+        }
+    },
+    dependOnDependencyAssertions: true,
+    columns: {
+        tranlineid: "Identifier for the transaction line.",
+        memo: "Memo or note associated with the transaction line.",
+        class_id: "Identifier for the class associated with the transaction line.",
+        department_id: "Identifier for the department related to the transaction line.",
+        department_name: "Name of the department.",
+        entity_id: "Identifier for the entity or record.",
+        subsidiary_id: "Identifier for the subsidiary or branch.",
+        vendor_id: "Identifier for the vendor.",
+        sku: "Stock Keeping Unit (SKU) associated with the transaction.",
+        rate: "Rate or price associated with the transaction.",
+        quantity: "Quantity involved in the transaction.",
+        custcol_attban: "Custom column or attribute related to the transaction.",
+        subsidiary_name: "Name of the subsidiary or branch.",
+        posting: "Posting or recording status of the transaction.",
+        document_number: "Document or reference number for the transaction.",
+        transaction_status_full_name: "Full name or description of the transaction status.",
+        transaction_status_name: "Name or label of the transaction status.",
+        transaction_date: "Date of the transaction.",
+        main_memo: "Main memo or note associated with the transaction.",
+        cashback_rep: "Identifier or name of the cashback representative.",
+        cashback_notes: "Notes or additional information about cashback.",
+        rebate_name: "Name or type of rebate associated with the transaction.",
+        rebate_type_name: "Name or label for the type of rebate.",
+        transaction_type: "Type or category of the transaction.",
+        createdby: "Identifier or name of the user who created the transaction.",
+        journal_displayname: "Display name or label for the journal entry.",
+        deposit_displayname: "Display name or label for the deposit entry.",
+        journal_item_fullname: "Full name or identifier of the journal item.",
+        deposit_item_fullname: "Full name or identifier of the deposit item.",
+        transactionline_item_fullname: "Full name or identifier of the transaction line item.",
+        transactionline_item_display_name: "Display name or label for the transaction line item.",
+        accounting_period_name: "Name of the accounting period.",
+        accounting_date: "End date of the accounting period.",
+        account_name: "Name of the account involved in the transaction.",
+        account_type: "Type of the account (e.g., expense, revenue).",
+        account_number: "Account number or code.",
+        alt_account_number: "Alternative account number or code.",
+        customer_entity_id: "Identifier for the customer entity.",
+        customer_netsuite_internal_id: "demo_platform internal identifier for the customer.",
+        demo_id: "Unique identifier for the member or entity.",
+        vendor_entity: "Identifier for the vendor entity.",
+        vendor_entity_number: "Vendor entity number or code.",
+        lrs_customer_type: "Type or classification of the customer.",
+        entity_name: "Name of the entity or member.",
+        class: "Class or category associated with the transaction.",
+        vendor_name: "Name of the vendor.",
+        secondary_vendor_name: "Name of the secondary vendor.",
+        ref: "Reference number or identifier.",
+        client_account_number: "Client account number or identifier.",
+        event_name: "Name or type of the event associated with the transaction.",
+        annual_show_show: "Name or label of the annual_show show.",
+        annual_show_show_id: "ID of annual_show show",
+        vendor_category: "Category or type of the vendor.",
+        secondary_vendor_entity_id: "Identifier for the secondary vendor entity.",
+        secondary_vendor_integer_id: "Integer identifier for the secondary vendor.",
+        secondary_member_customer_id: "When an entity id is stated on a transaction but if there's a secondary_member_customer_id listed as well, that means it's on behalf of that secondary_member etc",
+        tranline_created_from: "Information about the creation source of the transaction line.",
+        po_number: "Purchase order number associated with the transaction.",
+        tranline_line_last_modified_date: "Last modified date of the transaction line.",
+        transaction_last_modified_date: "Last modified date of the transaction.",
+        linked_member_demo_id: "demo ID of the linked member.",
+        amount: "Amount involved in the transaction.",
+        netsuite_amount: "Amount in demo_platform for the transaction.",
+        unpaid_amount: "Unpaid amount associated with the transaction.",
+        money_manager_entity_id: "Identifier for the entity related to money management.",
+        transaction_entity_id: "Identifier for the entity associated with the transaction.",
+        billing_period_name: "Name of the billing period.",
+        billing_period: "Parsed and normalized end date of the billing period, derived from billing_period_name.",
+        industry_name: "Name of the industry associated with the transaction; sourced from industries.name.",
+        line_created_date: "Timestamp when the transaction line was created; sourced from transaction_lines.linecreateddate.",
+        transaction_created_date: "	Date part of the transaction creation timestamp; sourced from transactions.createddate.",
+        secondary_entity_id: "Identifier secondary entity associated with the transaction."
+    },
+    assertions: {
+        uniqueKeys: [
+            ["transaction", "tranlineid"]
+        ]
+    }
+}
+
+WITH base AS(
+  SELECT
+    transaction_lines.id AS tranlineid,
+    transaction_lines.memo AS memo,
+    transaction_lines.class AS class_id,
+    transaction_lines.department AS department_id,
+    dept.fullname AS department_name,
+    entity.entityid AS entity_id,
+    transaction_lines.subsidiary AS subsidiary_id,
+    transaction_lines.custcol_lrs_check_vendor AS vendor_id,
+    transaction_lines.custcol_lrs_check_sku AS sku,
+    transaction_lines.rate,
+    transaction_lines.quantity,
+    transaction_lines.custcol_attban,
+    subsidiary.name AS subsidiary_name,
+    transactions.posting AS posting,
+    transaction_lines.transaction,
+    transactions.tranid AS document_number,
+    transactions.status AS transaction_status,
+    transactionstatus.fullname AS transaction_status_full_name,
+    transactionstatus.name AS transaction_status_name,
+    DATE(transactions.trandate) AS transaction_date,
+    transactions.memo AS main_memo,
+    transactions.custbody_cbn_rep AS cashback_rep,
+    transactions.custbody_cbn_notes AS cashback_notes,
+    rebate_control.name AS rebate_name,
+    reb_type.name AS rebate_type_name,
+    transactions.type AS transaction_type,
+    transactions.createdby AS createdby,
+    journal_item.displayname AS journal_displayname,
+    deposit_item.displayname AS deposit_displayname,
+    journal_item.fullname AS journal_item_fullname,
+    deposit_item.fullname AS deposit_item_fullname,
+    transactionline_item.fullname AS transactionline_item_fullname,
+    transactionline_item.displayname AS transactionline_item_display_name,
+    case
+      when transactions.type="Journal" then journal_item.displayname
+      when transactions.type="Deposit" then deposit_item.displayname
+      else transactionline_item.displayname
+      end as transaction_item,
+    case
+      when transactions.type="Journal" then journal_item.custitem_profitability_report_item
+      when transactions.type="Deposit" then deposit_item.custitem_profitability_report_item
+      else transactionline_item.custitem_profitability_report_item
+      end as profitability_report_item_id,
+      reporting_items.name as profitability_report_item,
+    case
+      when transactions.type="Journal" then journal_item.custitem_profitability_digital_type
+      when transactions.type="Deposit" then deposit_item.custitem_profitability_digital_type
+      else transactionline_item.custitem_profitability_digital_type
+      end as profitability_digital_type_id,
+      digital_types.name as profitability_digital_type,
+    case
+      when transactions.type="Journal" then journal_item.custitem_profitability_program_list
+      when transactions.type="Deposit" then deposit_item.custitem_profitability_program_list
+      else transactionline_item.custitem_profitability_program_list
+      end as profitability_program_list_id,
+      profitability_program_list.name as profitability_program,
+    case
+      when
+        case
+          when transactions.type="Journal" then journal_item.custitem_member_profitability
+          when transactions.type="Deposit" then deposit_item.custitem_member_profitability
+          else transactionline_item.custitem_member_profitability
+      end = "T" then True
+      else False
+      end as member_profitability,
+    accounting_periods.periodname AS accounting_period_name,
+    accounting_periods.enddate AS accounting_date,
+    accounts.accountsearchdisplayname AS account_name,
+    accounts.accttype AS account_type,
+    accounts.acctnumber AS account_number,
+    CONCAT(accounts.acctnumber, " - ", accounts.accountsearchdisplaynamecopy) AS alt_account_number,
+    customer.entityid AS customer_entity_id,
+    customer.id AS customer_netsuite_internal_id,
+    customer.entityid AS demo_id,
+    vendors.entityid AS vendor_entity,
+    vendors.entitynumber AS vendor_entity_number,
+    customer.custentity_lrs_customer_type AS lrs_customer_type,
+    entity.altname AS entity_name,
+    class.name AS class,
+    vendors.companyname AS vendor_name,
+    secondary_vendor.companyname AS secondary_vendor_name,
+    transaction_lines.custcol_lrs_check_ref AS ref,
+    transaction_lines.custcol_lrs_check_client_acct_num AS client_account_number,
+    customlist_events_list.name AS event_name,
+    show_list.name AS annual_show_show,
+    show_list.id AS annual_show_show_id, -- 2024-06-17 Temporarily removed per Andy request / brought back 2024-08-08
+    vendors.custentity_lrs_vendor_category AS vendor_category,
+    secondary_vendor.entityid AS secondary_vendor_entity_id,
+    secondary_vendor.id AS secondary_vendor_integer_id,
+    transaction_lines.custcol_secondary_member AS secondary_member_customer_id,
+    transaction_lines.createdfrom AS tranline_created_from,
+    transactions.otherrefnum as po_number,
+    transaction_lines.linelastmodifieddate AS tranline_line_last_modified_date,
+    transactions.lastmodifieddate AS transaction_last_modified_date,
+    customer.custentity_linked_member_demo_id,
+    transaction_lines.foreignamount * -1 AS amount,
+    IF
+    (transaction_lines.id = 0, ABS(transaction_lines.foreignamount), transaction_lines.foreignamount * -1) AS netsuite_amount,
+    transactions.foreignamountunpaid AS unpaid_amount,
+    IF
+    (transaction_lines.subsidiary IN (6,
+        11,
+        12), entity.entityid, customer.custentity_linked_member_demo_id) AS money_manager_entity_id,
+    t_e.transaction_entity_id,
+    billing_periods.name AS billing_period_name, -- Stakeholder add 2025-07-28
+    LAST_DAY(PARSE_DATE("%b %Y", billing_periods.name), month) AS billing_period, -- Stakeholder add 2025-07-28
+    industries.name AS industry_name, --- Stakeholder add 2025-07-28
+    transaction_lines.linecreateddate AS line_created_date, -- Stakeholder add 2025-07-28
+    DATE(transactions.createddate) AS transaction_created_date, -- Stakeholder added 2025-07-28
+    -- c.entityid AS secondary_entity_id, -- 2026-03-31 | Stakeholder | replaced with COALESCE to capture cases where the secondary member is listed as an entity on the transaction vs. being listed in the custcol_secondary_member field (where we can join to get the entityid)
+    coalesce(c.entityid,split(transaction_lines.custcol_lrs_check_member," -")[safe_offset(0)]) AS secondary_entity_id, -- 2026-03-31 | Stakeholder
+    transaction_lines.custcol_lrs_check_member as lrs_check_member
+  FROM
+    ${ref("netsuite_suiteanalytics", "transactionline")} transaction_lines
+  INNER JOIN
+    ${ref("netsuite_suiteanalytics", "transaction")} transactions
+  ON
+    transactions.id = transaction_lines.transaction
+  INNER JOIN
+    ${ref("netsuite_suiteanalytics", "transactionaccountingline")} transactionaccountingline
+  ON
+    transaction_lines.id = transactionaccountingline.transactionline
+    AND transaction_lines.transaction = transactionaccountingline.transaction
+  INNER JOIN
+    ${ref("netsuite_suiteanalytics", "account")} accounts
+  ON
+    accounts.id = transactionaccountingline.Account
+  INNER JOIN
+    ${ref("netsuite_suiteanalytics", "accountingperiod")} accounting_periods
+  ON
+    accounting_periods.ID = transactions.PostingPeriod
+  LEFT JOIN
+    ${ref("netsuite_suiteanalytics", "item")} journal_item
+  ON
+    transaction_lines.custcol1 = journal_item.id
+  LEFT JOIN
+    ${ref("netsuite_suiteanalytics", "item")} deposit_item
+  ON
+    transactions.custbody_deposititem = deposit_item.id
+  LEFT JOIN
+    ${ref("netsuite_suiteanalytics", "item")} transactionline_item
+  ON
+    transactionline_item.id = transaction_lines.item
+  left join
+  `demo-project.netsuite_suiteanalytics.customlist_profitability_report_item` reporting_items
+  on
+  reporting_items.id=coalesce(journal_item.custitem_profitability_report_item,deposit_item.custitem_profitability_report_item,transactionline_item.custitem_profitability_report_item)
+  left join
+  `demo-project.netsuite_suiteanalytics.customlist_profitability_digital_type` digital_types
+  on
+  digital_types.id=coalesce(journal_item.custitem_profitability_digital_type,deposit_item.custitem_profitability_digital_type,transactionline_item.custitem_profitability_digital_type)
+  left join
+  `demo-project.netsuite_suiteanalytics.customlist_profitability_program` profitability_program_list
+  on
+  profitability_program_list.id=coalesce(journal_item.custitem_profitability_program_list,deposit_item.custitem_profitability_program_list,transactionline_item.custitem_profitability_program_list)
+  LEFT JOIN
+    ${ref("netsuite_suiteanalytics", "subsidiary")} subsidiary
+  ON
+    transaction_lines.subsidiary = subsidiary.id
+  LEFT JOIN
+    ${ref("netsuite_suiteanalytics", "customer")} customer
+  ON
+    transactions.entity = customer.id
+  LEFT JOIN
+    ${ref("netsuite_suiteanalytics", "classification")} class
+  ON
+    transaction_lines.class = class.id
+  LEFT JOIN
+    (SELECT DISTINCT * FROM ${ref("netsuite_suiteanalytics", "entity")} WHERE _fivetran_deleted = FALSE) entity
+  ON
+    transaction_lines.entity = entity.id
+  LEFT JOIN
+    ${ref("netsuite_suiteanalytics", "vendor")} vendors
+  ON
+    vendors.id = entity.id
+  LEFT JOIN
+    ${ref("netsuite_suiteanalytics", "transactionstatus")} transactionstatus
+  ON
+    transactionstatus.id = transactions.status
+    AND transactionstatus.trantype = transactions.type
+  LEFT JOIN
+    ${ref("netsuite_suiteanalytics", "department")} dept
+  ON
+    dept.id = transaction_lines.department
+  LEFT JOIN
+    ${ref("netsuite_suiteanalytics", "customlist_rebate_control_list")} rebate_control
+  ON
+    rebate_control.id = transaction_lines.custcol_rebate_control_name
+  LEFT JOIN
+    ${ref("netsuite_suiteanalytics", "vendor")} secondary_vendor
+  ON
+    secondary_vendor.id = transaction_lines.custcol_lrs_check_vendor
+  LEFT JOIN
+    ${ref("netsuite_suiteanalytics", "customlist_lrs_rebate_type")} reb_type
+  ON
+    reb_type.id = transaction_lines.custcol_lrs_check_rebate_type
+  LEFT JOIN
+    ${ref("netsuite_suiteanalytics", "customlist_events_list")} customlist_events_list
+  ON
+    customlist_events_list.id = transaction_lines.custcol_event
+  LEFT JOIN
+    ${ref("netsuite_suiteanalytics", "customlist_pt_show_list")} show_list
+  ON
+    show_list.id = transactions.custbody_pt_show_id
+  LEFT JOIN (
+    SELECT
+      t.id AS transaction_id,
+      e.entityid AS transaction_entity_id
+    FROM
+      ${ref("netsuite_suiteanalytics", "transaction")} t
+    LEFT JOIN
+      (SELECT DISTINCT * FROM ${ref("netsuite_suiteanalytics", "entity")}) e
+    ON
+      e.id=t.entity
+    WHERE IFNULL(t._fivetran_deleted, FALSE) = FALSE
+      AND IFNULL(e._fivetran_deleted, FALSE) = FALSE
+  ) t_e
+  ON
+    transaction_lines.transaction = t_e.transaction_id
+  LEFT JOIN
+  ${ref("netsuite_suiteanalytics", "customlist_billing_period")} billing_periods -- Stakeholder add 2025-07-28
+  ON
+    billing_periods.id = transaction_lines.custcol_billing_period -- Stakeholder add 2025-07-28
+  LEFT JOIN
+    ${ref("netsuite_suiteanalytics", "customlist_esc_industries")} industries -- Stakeholder add 2025-07-28
+  ON -- Stakeholder add 2025-07-28
+    customer.custentity_esc_industry = industries.id
+  LEFT JOIN
+    ${ref("netsuite_suiteanalytics", "customer")} c
+  ON transaction_lines.custcol_secondary_member = c.id
+
+  WHERE
+    IFNULL(transaction_lines.memo, "") != "exclude_from_mm"
+    AND IFNULL(transactions.voided, "") != "T"
+    AND IFNULL(transaction_lines._fivetran_deleted, FALSE) = FALSE
+    AND IFNULL(transactions._fivetran_deleted, FALSE) = FALSE
+    AND IFNULL(transactionaccountingline._fivetran_deleted, FALSE) = FALSE
+    AND IFNULL(transactionstatus._fivetran_deleted, FALSE) = FALSE
+),
+vendor_fix AS (
+  -- There are vendors that are not being tracked correctly because downstream transformations look for
+  SELECT
+  * REPLACE(
+    CASE
+      WHEN transaction_entity_id IN ("8033","8033 CBN")
+        AND transactionline_item_fullname = "2315 - ANNUAL_SHOW Cash Back Now Payable"
+        THEN IFNULL(entity_id, secondary_entity_id)
+      ELSE entity_id
+      END AS entity_id
+  )
+  FROM base
+)
+
+SELECT
+  *
+FROM vendor_fix
+
+  -- ! Below are no longer desired. Keeping commented out for reference.
+  -- AND IFNULL(accounts._fivetran_deleted, FALSE) = FALSE
+  -- AND IFNULL(accounting_periods._fivetran_deleted, FALSE) = FALSE
+  -- AND IFNULL(journal_item._fivetran_deleted, FALSE) = FALSE
+  -- AND IFNULL(deposit_item._fivetran_deleted, FALSE) = FALSE
+  -- AND IFNULL(transactionline_item._fivetran_deleted, FALSE) = FALSE
+  -- AND IFNULL(reporting_items._fivetran_deleted, FALSE) = FALSE
+  -- AND IFNULL(digital_types._fivetran_deleted, FALSE) = FALSE
+  -- AND IFNULL(profitability_program_list._fivetran_deleted, FALSE) = FALSE
+  -- AND IFNULL(subsidiary._fivetran_deleted, FALSE) = FALSE
+  -- AND IFNULL(customer._fivetran_deleted, FALSE) = FALSE
+  -- AND IFNULL(class._fivetran_deleted, FALSE) = FALSE
+  -- AND IFNULL(entity._fivetran_deleted, FALSE) = FALSE
+  -- AND IFNULL(vendors._fivetran_deleted, FALSE) = FALSE
+  -- AND IFNULL(transactionstatus._fivetran_deleted, FALSE) = FALSE
+  -- AND IFNULL(dept._fivetran_deleted, FALSE) = FALSE
+  -- AND IFNULL(rebate_control._fivetran_deleted, FALSE) = FALSE
+  -- AND IFNULL(secondary_vendor._fivetran_deleted, FALSE) = FALSE
+  -- AND IFNULL(reb_type._fivetran_deleted, FALSE) = FALSE
+  -- AND IFNULL(customlist_events_list._fivetran_deleted, FALSE) = FALSE
+  -- AND IFNULL(show_list._fivetran_deleted, FALSE) = FALSE
+  -- AND IFNULL(billing_periods._fivetran_deleted, FALSE) = FALSE
+  -- AND IFNULL(industries._fivetran_deleted, FALSE) = FALSE

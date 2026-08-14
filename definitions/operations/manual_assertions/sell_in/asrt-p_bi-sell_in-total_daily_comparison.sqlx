@@ -1,0 +1,79 @@
+config {
+    type: "assertion",
+    description: "Compares sell_in aggregate snapshot values day-over-day. Fails when total_volume or total_units change for an existing vendor_id/distributor_id/date combination between the two most recent daily snapshots.",
+    tags: ["sell_in", "stand_alone", "independent assertion daily"]
+}
+
+-- Change Log
+-- 2026-06-15 | Stakeholder | Created assertion to detect day-over-day changes in sell_in snapshot aggregates
+
+WITH
+
+latest_snapshot_date AS (
+  SELECT MAX(DATE(snapshot_date_us_east)) AS snapshot_date
+  FROM ${ref("demo_reporting_snapshots", "sell_in_aggr_snapshots")}
+),
+
+previous_snapshot_date AS (
+  SELECT MAX(DATE(snapshot_date_us_east)) AS snapshot_date
+  FROM ${ref("demo_reporting_snapshots", "sell_in_aggr_snapshots")}
+  WHERE DATE(snapshot_date_us_east) < (SELECT snapshot_date FROM latest_snapshot_date)
+),
+
+latest AS (
+  SELECT
+    date,
+    vendor_id,
+    distributor_id,
+    total_volume,
+    total_units
+  FROM ${ref("demo_reporting_snapshots", "sell_in_aggr_snapshots")}
+  WHERE DATE(snapshot_date_us_east) = (SELECT snapshot_date FROM latest_snapshot_date)
+),
+
+previous AS (
+  SELECT
+    date,
+    vendor_id,
+    distributor_id,
+    total_volume,
+    total_units
+  FROM ${ref("demo_reporting_snapshots", "sell_in_aggr_snapshots")}
+  WHERE DATE(snapshot_date_us_east) = (SELECT snapshot_date FROM previous_snapshot_date)
+),
+
+-- inner join excludes new vendor/distributor combinations with no prior snapshot to compare against
+comparison AS (
+  SELECT
+    lat.date,
+    lat.vendor_id,
+    lat.distributor_id,
+    lat.total_volume AS current_volume,
+    prv.total_volume AS previous_volume,
+    lat.total_volume - prv.total_volume AS volume_diff,
+    lat.total_units AS current_units,
+    prv.total_units AS previous_units,
+    lat.total_units - prv.total_units AS units_diff
+  FROM 
+    latest AS lat
+  INNER JOIN 
+    previous AS prv
+    ON lat.date = prv.date
+    AND IFNULL(lat.vendor_id, -1) = IFNULL(prv.vendor_id, -1)
+    AND IFNULL(lat.distributor_id, -1) = IFNULL(prv.distributor_id, -1)
+),
+
+final AS (
+  SELECT 
+    *
+  FROM
+    comparison
+  WHERE
+    ROUND(IFNULL(volume_diff, 0), 4) != 0
+    OR ROUND(IFNULL(units_diff, 0), 4) != 0
+)
+
+SELECT 
+  * 
+FROM final
+

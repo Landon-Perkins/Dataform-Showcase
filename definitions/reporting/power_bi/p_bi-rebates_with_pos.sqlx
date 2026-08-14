@@ -1,0 +1,484 @@
+config { type: "table",
+        name: "rebates_with_pos",
+        schema: "demo_reporting",
+        description: "Ties rebates to pos with before and after effects of rebates on pos performance.",
+        bigquery:{
+          labels:{
+            scheduler:"dataform",
+            refresh:"daily"
+          }
+        },
+        tags: [
+          "reporting",
+          "p_bi daily"
+        ],
+        dependOnDependencyAssertions: true,
+        columns: {
+          py_comparable: "shows whether or not a dealer had the same event for the previous program year"
+          }
+        }
+
+-- Change log
+-- 2024-01-11 | Stakeholder |  additional CTEs made to create reb_pos_alt_join which brings a flag in called py_comparable (previous year is comparable bool), 
+--                        that shows whether or not a dealer had the same event for the previous program year
+
+WITH
+  pre_rebates AS( 
+    SELECT
+      r.demo_id,
+      r.product_key,
+      r.holiday_event,
+      r.holiday_vertical,
+      EXTRACT(year FROM r.rebate_created_date) AS year,
+      r.rebate_type,
+      r.rebate_status,
+      CASE
+        WHEN r.demo_program = TRUE THEN FALSE
+        WHEN r.demo_program = FALSE THEN TRUE
+        ELSE NULL
+        END AS holiday_member_related,      
+      r.program_start_date,
+      r.item_claim,
+      r.quantity,
+      b.brand_code,
+    FROM `demo-project.demo_staging.rebates` r
+    LEFT JOIN `demo-project.demo_staging.products` p
+      ON r.product_key = p.KEY
+    LEFT JOIN `demo-project.demo_staging.brands` b
+      ON p.brand_code = b.brand_code),
+  rebates AS (
+    SELECT
+      EXTRACT(year FROM pmap.event_start_date) AS program_year,
+      reb.demo_id,
+      reb.product_key,
+      reb.holiday_event,
+      pmap.event_name,
+      UPPER(reb.holiday_vertical) AS holiday_vertical,
+      pmap.event_start_date,
+      pmap.event_end_date,
+      DATE_DIFF(pmap.event_end_date,pmap.event_start_date,day)+1 AS number_of_days,
+      DATE_SUB(pmap.event_start_date,INTERVAL DATE_DIFF(pmap.event_end_date,pmap.event_start_date,day)+1 day) AS before_start_date,
+      DATE_SUB(pmap.event_end_date,INTERVAL DATE_DIFF(pmap.event_end_date,pmap.event_start_date,day)+1 day) AS before_end_date,
+      DATE_ADD(pmap.event_start_date,INTERVAL DATE_DIFF(pmap.event_end_date,pmap.event_start_date,day)+1 day) AS after_start_date,
+      DATE_ADD(pmap.event_end_date,INTERVAL DATE_DIFF(pmap.event_end_date,pmap.event_start_date,day)+1 day) AS after_end_date,
+      SUM(reb.item_claim) total_claim,
+      SUM(reb.quantity) AS total_units,
+    FROM
+      pre_rebates reb
+    INNER JOIN
+      `demo-project.demo_staging.pmap` pmap
+    ON
+      pmap.Event_Name=reb.holiday_event
+      AND pmap.year=IFNULL(EXTRACT(year FROM reb.program_start_date),reb.year)
+    WHERE
+      item_claim!=0
+      AND LOWER(rebate_type)="demo exclusive"
+      AND LOWER(rebate_status)!="declined"
+      AND holiday_member_related=FALSE
+      AND reb.product_key IS NOT NULL
+      AND holiday_vertical="Appliances"
+      AND LEFT(brand_code,3)!="CA_"
+      AND holiday_event!="NON HOLIDAY PROMO"
+    GROUP BY
+      program_year,
+      demo_id,
+      product_key,
+      holiday_event,
+      event_name,
+      holiday_vertical,
+      event_start_date,
+      event_end_date
+    HAVING
+      program_year>=2021 ),
+  durings AS (
+    SELECT
+      year,
+      date,
+      ROW_NUMBER() OVER (PARTITION BY year, event_name ORDER BY date) AS day_number,
+      event_name,
+      "during" AS timeline,
+      2 AS timeline_order,
+    FROM (SELECT
+            year,
+            event_name,
+            GENERATE_DATE_ARRAY(event_start_date,event_end_date) AS date
+          FROM
+            `demo-project.demo_staging.pmap` ),
+          UNNEST(date) AS date ), befores AS ( SELECT
+                                                year,
+                                                date,
+                                                ROW_NUMBER() OVER (PARTITION BY year, event_name ORDER BY date) AS day_number,
+                                                event_name,
+                                                "before" AS timeline,
+                                                1 AS timeline_order
+                                              FROM (SELECT
+                                                      year,
+                                                      event_name,
+                                                      GENERATE_DATE_ARRAY(DATE_SUB(event_start_date,INTERVAL DATE_DIFF(event_end_date,event_start_date,day)+1 day),DATE_SUB(event_end_date,INTERVAL DATE_DIFF(event_end_date,event_start_date,day)+1 day)) AS date
+                                                    FROM `demo-project.demo_staging.pmap`),UNNEST(date) AS date),
+  afters AS (
+    SELECT
+      year,
+      date,
+      ROW_NUMBER() OVER (PARTITION BY year, event_name ORDER BY date) AS day_number,
+      event_name,
+      "after" AS timeline,
+      3 AS timeline_order
+    FROM (SELECT
+            year,
+            event_name,
+            GENERATE_DATE_ARRAY(DATE_ADD(event_start_date,INTERVAL DATE_DIFF(event_end_date,event_start_date,day)+1 day),DATE_ADD(event_end_date,INTERVAL DATE_DIFF(event_end_date,event_start_date,day)+1 day)) AS date
+          FROM `demo-project.demo_staging.pmap`),UNNEST(date) AS date ),
+  timelines AS (
+    SELECT * FROM befores
+    UNION ALL
+    SELECT * FROM durings
+    UNION ALL
+    SELECT * FROM afters
+    ORDER BY
+      event_name,
+      date ),
+  timelines_with_number_of_days AS (
+    SELECT
+      year,
+      event_name,
+      MAX(day_number) AS event_number_of_days
+    FROM
+      timelines
+    WHERE
+      timeline="during"
+    GROUP BY
+      year,
+      event_name ),
+  final_timelines AS (
+    SELECT
+      *
+    FROM
+      timelines
+    LEFT JOIN
+      timelines_with_number_of_days
+    USING(year, event_name) ),
+  pos AS (
+    SELECT
+      date,
+      demo_id,
+      product_key,
+      sku,
+      brand_name,
+      brand_code,
+      parent_brand_name,
+      parent_brand_code, -- 2023-11-16 | Stakeholder
+      brand_segment,
+      showcase_major_category,
+      brand_is_luxury AS is_luxury,
+      SUM(price) AS pos_volume,
+      SUM(units) AS pos_units
+    FROM
+      ${ref("demo_reporting", "pos_incl_excep")} pos
+    WHERE
+      super_class = "APPLIANCES"
+      AND exception=FALSE
+      AND exception_excluded = FALSE
+    GROUP BY
+      date,
+      demo_id,
+      product_key,
+      sku,
+      brand_name,
+      brand_code, -- 2023-11-16 | Stakeholder
+      parent_brand_name,
+      parent_brand_code,
+      brand_segment,
+      showcase_major_category,
+      is_luxury ),
+  pos_with_member_attributes AS (
+    SELECT
+      pos.*,
+      members.company_name as preferred_name,
+      members.netsuite_division_name as division_name,
+      members.member_status,
+      brand_builder as is_brand_builder,
+      members.membership_termination_date as termination_date,
+      members.termination_reason as mms_termination_reason
+    FROM pos
+    INNER JOIN ${ref("demo_staging_netsuite","membership")} members
+    USING (demo_id) ),
+  pos_with_events AS (
+    SELECT
+      *,
+      final_timelines.year AS program_year,
+    FROM pos_with_member_attributes
+    INNER JOIN final_timelines
+    USING (date) ),
+  rebate_skus AS (
+    SELECT
+      DISTINCT program_year,
+      event_name,
+      product_key,
+      TRUE AS participant_sku
+    FROM rebates ),
+  rebate_dealers AS (
+    SELECT
+      DISTINCT program_year,
+      event_name,
+      demo_id,
+      TRUE AS participant_dealer
+    FROM
+      rebates ),
+  pos_with_participants AS (
+    SELECT
+      pos_with_events.*,
+      IFNULL(rebate_skus.participant_sku,FALSE) AS participant_sku,
+      IFNULL(rebate_dealers.participant_dealer,FALSE) AS participant_dealer
+    FROM
+      pos_with_events
+    LEFT JOIN
+      rebate_skus
+    ON
+      rebate_skus.program_year=pos_with_events.program_year
+      AND rebate_skus.event_name=pos_with_events.event_name
+      AND rebate_skus.product_key=pos_with_events.product_key
+    LEFT JOIN
+      rebate_dealers
+    ON
+      rebate_dealers.program_year=pos_with_events.program_year
+      AND rebate_dealers.event_name=pos_with_events.event_name
+      AND rebate_dealers.demo_id=pos_with_events.demo_id ),
+  dealer_event_number_of_days_during AS (
+    SELECT
+      program_year,
+      event_name,
+      demo_id,
+      COUNT(DISTINCT date) AS dealer_number_of_days_during
+    FROM
+      pos_with_participants
+    WHERE
+      timeline="during"
+    GROUP BY
+      program_year,
+      event_name,
+      demo_id ),
+  dealer_event_number_of_days_before AS (
+    SELECT
+      program_year,
+      event_name,
+      demo_id,
+      COUNT(DISTINCT date) AS dealer_number_of_days_before
+    FROM
+      pos_with_participants
+    WHERE
+      timeline="before"
+    GROUP BY
+      program_year,
+      event_name,
+      demo_id ),
+  dealer_event_number_of_days_after AS (
+    SELECT
+      program_year,
+      event_name,
+      demo_id,
+      COUNT(DISTINCT date) AS dealer_number_of_days_after
+    FROM
+      pos_with_participants
+    WHERE
+      timeline="after"
+    GROUP BY
+      program_year,
+      event_name,
+      demo_id ),
+  prefin AS (
+    SELECT
+      pos_with_participants.*,
+      IFNULL(dealer_number_of_days_before,0) AS dealer_number_of_days_before,
+      IFNULL(dealer_number_of_days_during,0) AS dealer_number_of_days_during,
+      IFNULL(dealer_number_of_days_after,0) AS dealer_number_of_days_after
+    FROM
+      pos_with_participants
+    LEFT JOIN
+      dealer_event_number_of_days_before
+    ON
+      dealer_event_number_of_days_before.program_year=pos_with_participants.program_year
+      AND dealer_event_number_of_days_before.event_name=pos_with_participants.event_name
+      AND dealer_event_number_of_days_before.demo_id=pos_with_participants.demo_id
+    LEFT JOIN
+      dealer_event_number_of_days_during
+    ON
+      dealer_event_number_of_days_during.program_year=pos_with_participants.program_year
+      AND dealer_event_number_of_days_during.event_name=pos_with_participants.event_name
+      AND dealer_event_number_of_days_during.demo_id=pos_with_participants.demo_id
+    LEFT JOIN
+      dealer_event_number_of_days_after
+    ON
+      dealer_event_number_of_days_after.program_year=pos_with_participants.program_year
+      AND dealer_event_number_of_days_after.event_name=pos_with_participants.event_name
+      AND dealer_event_number_of_days_after.demo_id=pos_with_participants.demo_id ),
+  rebate_skus_with_parents AS (
+    SELECT
+      rebate_skus.*,
+      brand_code,
+      parent_brand_code,
+      parent_brand_name
+    FROM
+      rebate_skus
+    LEFT JOIN
+      demo_staging.brand_categorizations brands
+    ON
+      brands.brand_code=SPLIT(rebate_skus.product_key,":")[OFFSET(0)]
+    WHERE
+      UPPER(brand_segment)!="LUXURY"), 
+      rebate_parent_brands AS (
+    SELECT
+      DISTINCT program_year,
+      event_name,
+      parent_brand_code,
+      TRUE AS participant_parent_brand
+    FROM
+      rebate_skus_with_parents ),
+  finalize AS (
+    SELECT
+      prefin.*,
+      IFNULL(rp.participant_parent_brand,FALSE) AS participant_parent_brand,
+    IF
+      (rp.participant_parent_brand IS NULL,"OTHER",prefin.parent_brand_name) AS parent_brand_roll_up
+    FROM
+      prefin
+    LEFT JOIN
+      rebate_parent_brands rp
+    USING
+      (program_year,
+        event_name,
+        parent_brand_code) ),
+  finalize_alternate AS (
+    SELECT
+      demo_id,
+      brand_name,
+      brand_code,  -- 2023-11-16 | Stakeholder
+      parent_brand_name,
+      parent_brand_code,
+      brand_segment,
+      showcase_major_category,
+      is_luxury,
+      preferred_name,
+      division_name,
+      member_status,
+      is_brand_builder,
+      termination_date,
+      mms_termination_reason,
+      year,
+      event_name,
+      timeline,
+      timeline_order,
+      event_number_of_days,
+      program_year,
+      participant_sku,
+      participant_dealer,
+      dealer_number_of_days_before,
+      dealer_number_of_days_during,
+      dealer_number_of_days_after,
+      participant_parent_brand,
+      parent_brand_roll_up,
+      COUNT(DISTINCT demo_id) AS unique_dealers,
+      SUM(pos_volume) AS pos_volume,
+      SUM(pos_units) AS pos_units,
+    FROM
+      finalize
+    GROUP BY
+      demo_id,
+      brand_name,
+      brand_code, -- 2023-11-16 | Stakeholder
+      parent_brand_name,
+      parent_brand_code,
+      brand_segment,
+      showcase_major_category,
+      is_luxury,
+      preferred_name,
+      division_name,
+      member_status,
+      is_brand_builder,
+      termination_date,
+      mms_termination_reason,
+      year,
+      event_name,
+      timeline,
+      timeline_order,
+      event_number_of_days,
+      program_year,
+      participant_sku,
+      participant_dealer,
+      dealer_number_of_days_before,
+      dealer_number_of_days_during,
+      dealer_number_of_days_after,
+      participant_parent_brand,
+      parent_brand_roll_up
+    ORDER BY
+      program_year,
+      event_name,
+      timeline_order),
+-- 2024-01-11 | Stakeholder
+-- below additional CTEs made to create reb_pos_alt_join which brings a flag in called py_comparable (previous year is comparable bool), 
+-- that shows whether or not a dealer had the same event for the previous program year
+  reb_pos AS (
+    SELECT
+      demo_id,
+      program_year,
+      event_name,
+      SUM(pos_volume) AS pos_volume
+    FROM finalize_alternate
+    WHERE timeline="during"
+    GROUP BY
+      demo_id,
+      program_year,
+      event_name),
+  cj AS (
+    SELECT
+      *
+    FROM ((SELECT
+            DISTINCT demo_id
+          FROM reb_pos)
+          CROSS JOIN (SELECT
+                        DISTINCT event_name
+                      FROM reb_pos)
+                      CROSS JOIN (SELECT
+                                    DISTINCT program_year
+                                  FROM reb_pos))),
+  all_in AS (
+    SELECT
+      *
+    FROM cj
+    LEFT JOIN reb_pos
+    USING(demo_id,event_name,program_year)),
+  prefin_reb_pos AS (
+    SELECT
+      cy.*,
+      py.pos_volume AS py_volume,
+      ppy.pos_volume AS ppy_volume,
+      SAFE_DIVIDE(cy.pos_volume,py.pos_volume)-1 AS cy_vs_py,
+      ABS(SAFE_DIVIDE(cy.pos_volume,py.pos_volume)-1) AS abs_cy_vs_py,
+    FROM all_in cy
+    LEFT JOIN all_in py
+    ON py.program_year=cy.program_year-1
+      AND cy.demo_id=py.demo_id
+      AND py.event_name=cy.event_name
+    LEFT JOIN all_in ppy
+    ON ppy.program_year=cy.program_year-2
+      AND cy.demo_id=ppy.demo_id
+      AND ppy.event_name=cy.event_name ),
+  finalize_reb_pos AS (
+    SELECT
+      *,
+      CASE
+        WHEN pos_volume IS NOT NULL AND py_volume IS NOT NULL AND pos_volume>0 AND py_volume>0 THEN TRUE
+        ELSE FALSE
+        END AS py_comparable
+    FROM prefin_reb_pos)--,      
+  -- reb_pos_alt_join AS (
+SELECT
+  fin.*,
+  finalize_reb_pos.py_comparable
+FROM finalize_alternate fin
+LEFT JOIN finalize_reb_pos
+USING(demo_id,event_name,program_year)
+
+-- SELECT 
+--   *
+-- FROM reb_pos_alt_join

@@ -1,0 +1,276 @@
+config { type: "table",
+        name: "alpha_team_support",
+        schema: "profitability",
+        description: "Alphanumeric team support. Building block for profitability",
+        tags: [
+          "profitability",
+          ],
+        bigquery:{
+          labels:{
+            scheduler:"dataform",
+            frequency:"daily",
+            author:"Stakeholder"
+          }
+        },
+        assertions: {
+          },
+        columns: {
+          DATE: "The last day of the month for which the team support allocation is calculated.",
+          demo_id: "The demo ID of the dealer.",
+          entity_id: "The demo ID of the dealer converted to a string.",
+          subsidiary_id: "The subsidiary ID, which is 6 for Demo Organization.",
+          subsidiary_name: "The name of the subsidiary, which is 'Demo Organization'.",
+          amount: "The allocated team support amount for the dealer.",
+          impact_amount: "The allocated team support amount for the dealer.",
+          account_type: "The account type, which is 'Income'.",
+          account_number: "The account number for team support, which is '4110 - Team Support'.",
+          item: "The financial type of the team support allocation.",
+          description: "A description of the team support allocation, combining the vendor name and financial type.",
+          vendor_id: "The vendor ID associated with the team support allocation. This is always NULL in this table.",
+          distributor_id: "The distributor ID associated with the team support allocation. This is always NULL in this table.",
+          program: "The program for which the team support is allocated, which is 'Team Support'.",
+          category: "The category of the team support allocation.",
+          business_segment: "The business segment for which the team support is allocated, which is 'Merchant'."
+        }
+}
+
+WITH
+  alpha_team_support AS (
+    SELECT
+      * EXCEPT (DATE),
+      DATE(DATE) AS DATE,
+      CASE
+        WHEN class = "Oasys" THEN "Electronics"
+        WHEN class = "Outdoor" THEN "Furniture"
+        WHEN class = "Ellipsys" THEN "Electronics"
+        WHEN class = "Exchange" THEN "Electronics"
+        --when class="Azione" then "Electronics"
+        WHEN class = "Connected Services" THEN "Electronics"
+        ELSE class
+      END AS general_category
+    FROM
+      `demo-project.demo_sources_tolga.team_support_netsuite_generic_no_vendor_ids`
+  ),
+  sell_in_by_member AS (
+    SELECT
+      DATE,
+      CASE
+        WHEN demo_id IN (
+          SELECT DISTINCT
+            demo_id
+          FROM
+            `demo-project.demo_staging_netsuite.membership`
+        ) THEN demo_id
+        WHEN demo_id IS NULL THEN 0
+        ELSE 0
+      END AS demo_id,
+      CASE
+        WHEN LOWER(source_file_brand) LIKE "azione%" THEN "Azione"
+        WHEN general_category = "Distributor Partners" THEN "Electronics"
+        WHEN general_category = "Outdoor" THEN "Furniture"
+        ELSE general_category
+      END AS general_category,
+      SUM(volume) AS total_volume
+    FROM
+      `demo-project.demo_reporting.sell_in`
+    GROUP BY
+      DATE,
+      demo_id,
+      general_category
+  ),
+  gt AS (
+    SELECT
+      DATE,
+      general_category,
+      SUM(total_volume) AS grand_total
+    FROM
+      sell_in_by_member
+    GROUP BY
+      DATE,
+      general_category
+  ),
+  pcts AS (
+    SELECT
+      sell_in_by_member.*,
+      IFNULL(
+        SAFE_DIVIDE(sell_in_by_member.total_volume, gt.grand_total),
+        0
+      ) AS pct_of_total
+    FROM
+      sell_in_by_member
+      LEFT JOIN gt ON gt.date = sell_in_by_member.date
+      AND gt.general_category = sell_in_by_member.general_category
+  ),
+  calendar AS (
+    SELECT
+      *
+    FROM
+      UNNEST (
+        GENERATE_DATE_ARRAY(
+          "2017-12-01",
+          DATE_TRUNC(CURRENT_DATE(), MONTH),
+          INTERVAL 1 MONTH
+        )
+      ) AS DATE
+  ),
+  vendor_calendar AS (
+    SELECT
+      *
+    FROM
+      calendar
+      CROSS JOIN (
+        SELECT DISTINCT
+          general_category
+        FROM
+          pcts
+      )
+  ),
+  reported AS (
+    SELECT
+      vendor_calendar.*,
+      IF(
+        vendor_reported.general_category IS NOT NULL,
+        TRUE,
+        FALSE
+      ) AS has_reporting
+    FROM
+      vendor_calendar
+      LEFT JOIN (
+        SELECT DISTINCT
+          DATE,
+          general_category
+        FROM
+          pcts
+      ) vendor_reported USING (DATE, general_category)
+  ),
+  prev_future_dates AS (
+    SELECT
+      curr.*,
+      prev.date AS prev_date,
+      IFNULL(prev.has_reporting, FALSE) AS prev_has_reporting,
+      future.date AS future_date,
+      future.has_reporting AS future_has_reporting
+    FROM
+      reported curr
+      LEFT JOIN (
+        SELECT
+          *
+        FROM
+          reported
+        WHERE
+          has_reporting = TRUE
+      ) prev ON curr.date > prev.date
+      AND curr.general_category = prev.general_category
+      LEFT JOIN (
+        SELECT
+          *
+        FROM
+          reported
+        WHERE
+          has_reporting = TRUE
+      ) future ON curr.date < future.date
+      AND curr.general_category = future.general_category
+  ),
+  prev_future_prefin AS (
+    SELECT
+      *,
+      ROW_NUMBER() OVER (
+        PARTITION BY
+          DATE,
+          general_category
+        ORDER BY
+          prev_date DESC
+      ) prev_date_test,
+      ROW_NUMBER() OVER (
+        PARTITION BY
+          DATE,
+          general_category
+        ORDER BY
+          future_date ASC
+      ) future_date_test
+    FROM
+      prev_future_dates
+  ),
+  takers AS (
+    SELECT
+      *,
+      CASE
+        WHEN has_reporting = TRUE THEN DATE
+        WHEN has_reporting = FALSE
+        AND prev_has_reporting = TRUE
+        AND prev_date_test = 1 THEN prev_date
+        WHEN has_reporting = FALSE
+        AND prev_has_reporting = FALSE
+        AND future_date_test = 1 THEN future_date
+        ELSE NULL
+      END AS take_this_date
+    FROM
+      prev_future_prefin
+  ),
+  bfill_ffill AS (
+    SELECT DISTINCT
+      DATE,
+      general_category,
+      has_reporting,
+      take_this_date
+    FROM
+      takers
+    WHERE
+      take_this_date IS NOT NULL
+  ),
+  pct_allocations AS (
+    SELECT
+      bfill_ffill.date,
+      bfill_ffill.general_category,
+      pcts.demo_id,
+      pct_of_total
+    FROM
+      bfill_ffill
+      LEFT JOIN pcts ON pcts.date = bfill_ffill.take_this_date
+      AND bfill_ffill.general_category = pcts.general_category
+  ),
+  ts AS (
+    SELECT
+      * EXCEPT (DATE, vendor_id),
+      DATE(DATE) AS DATE,
+      vendor_id AS general_category
+    FROM
+      `demo-project.demo_sources_tolga.team_support_netsuite_generic_no_vendor_ids`
+  ),
+  test AS (
+    SELECT
+      *,
+      team_support * pct_of_total AS team_support_allocation
+    FROM
+      alpha_team_support
+      LEFT JOIN pct_allocations USING (DATE, general_category) --where extract(year from date)=2023
+  ),
+  finalize AS (
+    SELECT
+      LAST_DAY(DATE, MONTH) AS DATE,
+      demo_id,
+      SAFE_CAST(demo_id AS STRING) AS entity_id,
+      --null as linked_member_demo_id,
+      --null as digital_customer_demo_id,
+      6 AS subsidiary_id,
+      "Demo Organization" AS subsidiary_name,
+      team_support_allocation AS amount,
+      team_support_allocation AS impact_amount,
+      "Income" AS account_type,
+      "4110 - Team Support" AS account_number,
+      financial_type AS item,
+      CONCAT(vendor_name, " - ", financial_type) AS description,
+      NULL AS vendor_id,
+      NULL AS distributor_id,
+      "Team Support" AS program,
+      class AS category,
+      "Merchant" AS business_segment
+    FROM
+      test
+    WHERE
+      team_support_allocation != 0
+  )
+SELECT
+  *
+FROM
+  finalize

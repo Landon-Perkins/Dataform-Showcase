@@ -1,0 +1,32 @@
+config { type: "incremental",
+         name: "pos_tracking_snapshot",
+         schema: "demo_sources",
+         description: "Purpose: Track snapshots for future reference.",
+         bigquery: {
+          labels: {
+            scheduler: "dataform",
+            frequency: "daily"
+          }
+        },
+         tags: ["snapshots daily",
+            "snapshot"],
+         protected: true
+        }
+pre_operations {
+  ALTER TABLE ${self()}
+  ADD COLUMN IF NOT EXISTS event_label STRING,
+  ADD COLUMN IF NOT EXISTS member_notes STRING,
+  ADD COLUMN IF NOT EXISTS cancellation_reason STRING,
+  ADD COLUMN IF NOT EXISTS showcase_sales_type STRING,
+  ADD COLUMN IF NOT EXISTS assigned_to STRING
+}
+
+
+SELECT
+  *,
+  CURRENT_TIMESTAMP() AS snapshot_timestamp
+FROM
+  `demo-project.sheets_staging.pos_tracking`
+WHERE
+  demo_id IS NOT NULL
+

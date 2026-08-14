@@ -1,0 +1,44 @@
+config {
+    type: "incremental",
+    name: "netsuite_row_count_variance_log",
+    schema: "dataform_assertions",
+    bigquery: {
+        labels: {
+            scheduler: "dataform",
+            frequency: "hourly",
+            author: "Stakeholder"
+        }
+    },
+    tags: [
+      "demo_platform", 
+      "log",
+      "independent assertion 1 hour"],
+    protected: true,
+    dependencies: [
+    ]
+}
+
+-- Change Log
+-- 2026-03-27 | Stakeholder | Added incremental dedup on (table_name, baseline_captured_at, current_count)
+--                       to prevent duplicate log entries while still capturing new failures
+--                       on the same table if the row count changes further within the same day
+--
+-- Specifications | The assertion must execute first and be listed as a depencency here. 
+--                  if the log runs first in the same workflow, it will query the assertion 
+--                  view (which dynamically reads the log), insert the new records, 
+--                  and then when Dataform later executes the assertion check, the log already contains 
+--                  those records, so the assertion returns 0 rows and reports as passing. 
+--                  Any alert downstream triggered by assertion failure would be silently missed.
+
+SELECT
+  src.*,
+  CURRENT_DATETIME("America/New_York") AS capture_datetime_us_east
+FROM `dataform_assertions.asrt-netsuite_row_count_variance` AS src
+
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM ${self()} AS log
+    WHERE log.table_name = src.table_name
+      AND log.baseline_captured_at = src.baseline_captured_at
+      AND log.current_count = src.current_count
+  )

@@ -1,0 +1,44 @@
+config { type: "incremental",
+         name: "customer_omnibus_snapshots",
+         schema: "demo_staging_netsuite",
+         bigquery: {
+          labels: {
+            scheduler: "dataform"
+          }
+         },
+        tags: ["demo_staging_netsuite",
+            "crm_netsuite_snapshots",
+            "snapshots daily",
+            "snapshot"],
+         protected: true
+        }
+
+pre_operations {
+  ALTER TABLE ${self()}
+  ADD COLUMN IF NOT EXISTS is_linked_member BOOL,
+}
+
+SELECT
+  *,
+  CURRENT_DATETIME('America/New_York') AS snapshot_date_us_east
+FROM `demo-project.demo_staging_netsuite.customer_omnibus`
+
+post_operations {
+-- Prunes completed weeks to their final (latest) snapshot per unique key.
+-- Weeks that are still in progress (current ISO week) are left untouched -- all daily snapshots are preserved.
+-- Once a week ends, the next run removes all but the last snapshot for each key in that week.
+  DELETE FROM ${self()}
+  WHERE
+    DATE_TRUNC(DATE(snapshot_date_us_east), ISOWEEK) < DATE_TRUNC(CURRENT_DATE('America/New_York'), ISOWEEK)
+    AND snapshot_date_us_east NOT IN (
+      SELECT MAX(snapshot_date_us_east)
+      FROM ${self()}
+      WHERE DATE_TRUNC(DATE(snapshot_date_us_east), ISOWEEK) < DATE_TRUNC(CURRENT_DATE('America/New_York'), ISOWEEK)
+      GROUP BY
+        customer_id,
+        service_category,
+        service_id,
+        subscription_id,
+        DATE_TRUNC(DATE(snapshot_date_us_east), ISOWEEK)
+    )
+}

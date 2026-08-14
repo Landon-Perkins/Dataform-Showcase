@@ -1,0 +1,94 @@
+config {
+    type: "table",
+    name: "money_manager_credit_memo_invoice",
+    schema: "money_manager",
+    description: "Finance reconciliation model that links credit memos to invoice activity for collections and applied-amount analysis.",
+    tags: ["money_manager"],
+    bigquery: {
+        labels: {
+            scheduler: "dataform",
+            refresh: "hourly",
+            author: "Stakeholder"
+        }
+    },
+    columns: {
+        credit_memo_id: "Identifier for the credit memo transaction.",
+        date: "Date of the credit memo transaction.",
+        document_number: "Reference or document number for the credit memo.",
+        credit_amount: "Amount of the credit memo.",
+        last_update: "Last update date for the credit memo transaction.",
+        invoice_netsuite_id: "demo_platform identifier for the associated invoice.",
+        credit_memo_netsuite_id: "demo_platform identifier for the credit memo.",
+        applied_amount: "Applied amount associated with the credit memo."
+    }
+}
+
+WITH
+  invoice_credit_memo AS (
+    SELECT
+      transaction AS credit_memo_id,
+      DATE(transaction_date) AS DATE,
+      document_number,
+      ABS(netsuite_amount) AS credit_amount,
+      DATE(transaction_last_modified_date) AS last_update
+    FROM
+        ${ref("money_manager", "money_manager")}
+    WHERE
+      transaction_type = "CustCred"
+      AND transaction_status_full_name != "Credit Memo : Voided"
+      --and subsidiary_id=6
+      AND tranlineid = 0
+      --and lrs_customer_type=3 --might bring this back
+      AND ABS(netsuite_amount) != 0
+  ),
+  prefin AS (
+    SELECT
+      next.previousdoc AS invoice_netsuite_id,
+      icm.credit_memo_id AS credit_memo_netsuite_id,
+      next.foreignamount AS applied_amount
+    FROM
+      invoice_credit_memo icm
+      LEFT JOIN (
+        SELECT DISTINCT
+          nextdoc,
+          previousdoc,
+          foreignamount
+        FROM
+            ${ref("netsuite_suiteanalytics", "nexttransactionlinelink")}
+        WHERE
+          foreignamount IS NOT NULL
+          --and _fivetran_deleted=False --!!!! do we need this here???? !!!!
+      ) next ON next.nextdoc = icm.credit_memo_id
+  ),
+  finalize AS (
+    SELECT
+      invoice_netsuite_id,
+      credit_memo_netsuite_id,
+      SUM(applied_amount) AS applied_amount
+    FROM
+      prefin
+    GROUP BY
+      invoice_netsuite_id,
+      credit_memo_netsuite_id
+    HAVING
+      applied_amount IS NOT NULL
+  )
+SELECT
+  finalize.*,
+  applied_dates.credit_applied_date
+FROM
+  finalize
+  LEFT JOIN (
+    SELECT
+      id AS credit_memo_netsuite_id,
+      DATE(trandate) credit_applied_date
+    FROM
+      ${ref("netsuite_suiteanalytics", "transaction")}
+  ) AS applied_dates USING (credit_memo_netsuite_id)
+WHERE
+  invoice_netsuite_id IN (
+    SELECT DISTINCT
+      netsuite_id
+    FROM
+    ${ref("money_manager", "money_manager_invoices")})
+

@@ -1,0 +1,373 @@
+config {
+    type: "table",
+    name: "sell_in",
+    schema: "demo_staging",
+    description: "Sell-in staging model that standardizes vendor, distributor, and product-level transaction data for downstream reporting.",
+    bigquery: {
+        labels: {
+        scheduler: "dataform"
+        }
+    },
+    tags: [
+        "demo_staging",
+        "sell_in",
+        // "s_o_t 1 hour"
+    ],
+    dependencies: [
+        "asrt-d_w-member_sales-vendor_volume_vs_units"
+    ],
+    columns: {
+        is_contractor: "whirlpool has special contractor team support percentages based which authorized accounts our dealers purchase with. this identifies which ones."
+    },
+    assertions: {
+        rowConditions: [
+            "not account_number like '%.0'",
+            "not (regexp_contains(lower(source_file_brand),'(azione|oasys|ellipsys)') and not regexp_contains(source_file_brand,'^(AZIONE|OASYS|ELLIPSYS)'))",
+            "not lower(account_number) like '%total%'",
+            // need to clean up sell-in before this is useful
+            // "not lower(account_number) = 'nan'"
+        ]
+    }
+}
+
+with
+customer as (
+    select distinct
+        customer.id,
+        customer.altname as name,
+        mn_vendor_id,
+        nsv.general_category,
+        s.name as sub_name,
+        -- customer._fivetran_deleted,
+    from `demo-project.netsuite_suiteanalytics.customer` customer
+    left join unnest(split(custentity_activenet_id,'-')) as mn_vendor_id
+    left join `demo-project.demo_staging_netsuite.netsuite_vendors` nsv
+        on nsv.id = customer.id
+    LEFT JOIN `demo-project.netsuite_suiteanalytics.customersubsidiaryrelationship` csr
+      ON customer.id = csr.entity
+    left join `demo-project.netsuite_suiteanalytics.subsidiary` s
+      on csr.subsidiary = s.id
+    where custentity_lrs_customer_type=4
+    qualify row_number() over (partition by mn_vendor_id order by csr.subsidiary)=1
+),
+
+original_algo AS (
+    SELECT *
+    FROM product_sku_match.finalize_alternate_algo_flat
+    WHERE vendor_id NOT IN (114, 4445)
+),
+
+pns AS (
+    SELECT
+        SAFE_CAST(SPLIT(provider,"-")[OFFSET(0)] AS int64) AS provider,
+        pn,
+        REGEXP_REPLACE(UPPER(pn),r"[^A-Z0-9]","") AS clean_pn,
+        SUM(volume) AS total_volume
+    FROM demo_sources.member_sales_raw
+    WHERE
+        distributor_id=114
+        OR vendor_id=4445
+    GROUP BY
+        provider,
+        pn
+),
+
+dedupes AS (
+    SELECT
+        pns.*,
+        p.key,
+    FROM pns
+    LEFT JOIN demo_staging.products p ON p.pn=pns.clean_pn
+    WHERE
+        LEFT(p.key,3)!="CA_"
+        AND p.super_class_code IN ("APPL","OUTDR","OTHER")
+    qualify ROW_NUMBER() OVER (PARTITION BY pns.provider, pns.pn ORDER BY p.brand_code)=1
+),
+
+supplemental AS (
+    SELECT
+        provider AS vendor_id,
+        pns.pn,
+        pns.clean_pn,
+        dedupes.key,
+    FROM pns
+    LEFT JOIN dedupes USING (provider,pn,clean_pn)
+),
+
+renewed_algo AS (
+    SELECT * FROM original_algo
+    UNION ALL
+    SELECT * FROM supplemental
+),
+
+customer_id_algo as (
+    select a.* replace(coalesce(c.id,cd.id) as vendor_id),
+    from renewed_algo a
+    left join customer c
+        on safe_cast(c.mn_vendor_id as int) = a.vendor_id
+    left join demo_sources.distribution_channels dc
+        on if(c.id is null,a.vendor_id,0) = dc.id
+    left join customer cd
+        on safe_cast(cd.mn_vendor_id as int) = dc.vendor_id
+    where key is not null -- removes null product keys that are causing duplicates. probably need to look into source
+    qualify row_number() over (partition by coalesce(c.id,cd.id), pn, clean_pn, key)=1
+),
+
+aa as (
+    select
+        naa.*,
+        mn_vendor_id
+    from ${ref("demo_staging_netsuite", "netsuite_authorized_accounts")} naa
+    left join netsuite_suiteanalytics.customer
+        on naa.vendor_customer_id = customer.id
+    left join unnest(split(customer.custentity_activenet_id,'-')) as mn_vendor_id
+    qualify row_number() over (
+        partition by authorized_account_number, mn_vendor_id
+        order by last_modified desc) = 1
+),
+
+si_direct as (
+    select
+        case
+            when sid.vendor_id = 127521 and lower(source_file_brand) = 'bedding' then 13523 -- correction for ashely bedding
+            else sid.vendor_id
+        end as vendor_id,
+        account_number,
+        date,
+        volume,
+        units,
+        sid.pn,
+        case
+            when sid.vendor_id is not null and sid.distributor_id is not null then concat(sid.vendor_id,'-',sid.distributor_id)
+            else cast(coalesce(sid.vendor_id,sid.distributor_id) as string)
+        end as provider,
+        distributor_id,
+        source_file_brand,
+        discount_from_invoice,
+        filename,
+        import_ts,
+        safe_cast(null as string) as old_product_key,
+        CASE -- 2024-03-19 | Stakeholder | updated logic
+            WHEN sid.vendor_id=4445 AND SPLIT(algo.key,":")[offset(0)] NOT IN (
+                SELECT DISTINCT brand_code
+                FROM demo_staging.brand_categorizations
+                WHERE parent_brand_code="MIDDLEBY"
+                ) THEN NULL
+            WHEN sid.vendor_id=1084 AND SPLIT(algo.key,":")[offset(0)] NOT IN (
+                SELECT DISTINCT brand_code
+                FROM demo_staging.brand_categorizations
+                WHERE parent_brand_code="THRK"
+                ) THEN NULL
+            WHEN sid.vendor_id=39 AND SPLIT(algo.key,":")[offset(0)] NOT IN (
+                SELECT DISTINCT brand_code
+                FROM demo_staging.brand_categorizations
+                WHERE parent_brand_code="SUM"
+                ) THEN NULL
+            WHEN algo.key="CASTL:NAN" and sid.pn="nan" THEN NULL
+            ELSE algo.key
+        END AS product_key,
+        string(null) as id,
+        string(null) as member_sale_import_id
+    from demo_sources.sell_in_direct sid
+    left join demo_staging_netsuite.netsuite_vendors nsv
+        on nsv.id = sid.vendor_id
+    left join demo_staging_netsuite.netsuite_vendors nsd
+        on nsd.id = sid.distributor_id
+    left join demo_staging_netsuite.netsuite_authorized_accounts aa
+        on sid.account_number = aa.authorized_account_number
+        and coalesce(nsd.parent,nsv.parent,sid.distributor_id,sid.vendor_id) = aa.vendor_customer_id
+    left join customer_id_algo algo
+        on algo.vendor_id = sid.vendor_id
+        and algo.pn=sid.pn
+    where not sid.is_deleted
+),
+
+-- need to check if this is still needed, they're old ids
+si_old_ven_fix as (
+    select
+        * except (vendor_id,distributor_id),
+        case
+            when vendor_id in (7,8,96,4360) then null
+            when vendor_id = 175 and source_file_brand = 'Bedding' then 4826
+            else vendor_id
+        end as vendor_id,
+        CASE
+            WHEN vendor_id=7 THEN 7
+            WHEN vendor_id=8 THEN 8
+            WHEN vendor_id=96 THEN 96
+            ELSE distributor_id
+        END AS distributor_id,
+    from demo_sources.member_sales
+),
+
+si_old as (
+    select
+        case
+            when ms.vendor_id = 175 and lower(source_file_brand) = 'bedding' then 13523 -- splits out ashely bedding historically
+            else coalesce(child.id,vc.id)
+        end as vendor_id,
+        regexp_extract(account_number,'^(.*)-.*$') as account_number,
+        date,
+        volume,
+        units,
+        pn,
+        case
+            when vc.id is not null and dc.id is not null then concat(vc.id,'-',dc.id)
+            else cast(coalesce(vc.id,dc.id) as string)
+        end as provider,
+        dc.id as distributor_id,
+        source_file_brand,
+        discount_from_invoice,
+        i.filename,
+        safe_cast(i.created_date as timestamp) as import_ts,
+        old_product_key,
+        product_key,
+        ms.id,
+        ms.member_sale_import_id
+    from si_old_ven_fix ms
+    left join customer vc
+        on safe_cast(vc.mn_vendor_id as int) = ms.vendor_id
+    left join demo_sources.distribution_channels dists on ms.distributor_id = dists.id
+    left join customer dc
+        on safe_cast(dc.mn_vendor_id as int) = dists.vendor_id
+    left join demo_sources.member_sale_imports i
+        on ms.member_sale_import_id = i.id
+    left join demo_staging_netsuite.netsuite_vendors nsv
+        on vc.id = nsv.id
+    left join demo_staging_netsuite.netsuite_vendors child
+        on nsv.id = child.parent
+        and lower(regexp_extract(lower(source_file_brand),'(azione|oasys|ellipsys|bedding)')) = lower(child.general_category)
+        and if(regexp_contains(filename,r'\_can\_'),true,false) = child.canadian_vendor
+),
+
+stacked as (
+    select * from si_direct
+    union all
+    select * from si_old
+),
+
+fei_am as (
+    select distinct
+        account_number,
+        SAFE_CAST(demo_id as INT64) as demo_id
+    from (
+        select distinct account_number, demo_id
+        from `demo-project.demo_sources.fei_account_mapping_generic`
+        where account_number not in (
+            select account_number
+            from (
+                select distinct account_number, demo_id
+                from `demo-project.demo_sources.fei_account_mapping_generic`
+            )
+            group by all
+            having count(*) > 1
+        )
+    )
+),
+
+auth_accounts as (
+    select
+        s.*,
+        naa.demo_id,
+        naa.account_name,
+    from stacked s
+    left join demo_staging_netsuite.netsuite_vendors nsv
+        on s.vendor_id = nsv.id
+    left join demo_staging_netsuite.netsuite_vendors nsd
+        on s.distributor_id = nsd.id
+    left join demo_staging_netsuite.netsuite_authorized_accounts naa
+        on coalesce(nsd.parent,nsv.parent,s.distributor_id,s.vendor_id) = naa.vendor_customer_id
+        and s.account_number = naa.authorized_account_number
+),
+
+ven_fix AS (
+    select
+        -- s.* except(pn,product_key,demo_id,vendor_id),
+        s.* replace(
+            -- coalesce(vendor_id,distributor_id) as vendor_id, -- not doing this yet
+            IF(s.pn = "FULL" AND s.product_key="LBT:FULL", NULL, s.pn) AS pn,
+            CASE
+                WHEN s.product_key = "LBT:FULL" THEN null
+                WHEN s.vendor_id = 13270 AND s.product_key IS NULL THEN 'FPK:FPK9999'
+                WHEN s.vendor_id = 13413 AND s.product_key IS NULL THEN 'SPQ:SPQ9999'
+                WHEN s.vendor_id = 13523 AND s.product_key IS NULL AND LOWER(s.source_file_brand) = 'bedding' THEN 'ASHLEY:ASHLEY9998'
+                WHEN s.vendor_id = 13523 AND s.product_key IS NULL THEN 'ASHLEY:ASHLEY9999'
+                WHEN s.vendor_id = 13494 AND s.product_key IS NULL THEN 'SEALY:SEALY9999'
+                WHEN s.vendor_id = 13255 AND s.product_key IS NULL THEN 'TMP:TMP9999'
+                WHEN s.vendor_id = 13312 AND s.product_key IS NULL THEN 'SAMSUNG:SAMSUNG9999'
+                WHEN s.vendor_id = 13528 AND s.product_key IS NULL THEN 'THE:THE9999'
+                WHEN s.vendor_id = 13463 AND s.product_key IS NULL THEN 'SIMMONS:SIMMONS9999'
+                WHEN s.vendor_id = 13446 AND s.product_key IS NULL THEN 'SER:SER9999'
+                WHEN s.vendor_id = 13631 AND s.product_key IS NULL THEN 'MOUF:MOUF9999'
+                WHEN s.vendor_id = 13448 AND s.product_key IS NULL THEN 'COASTER:COASTER9999'
+                WHEN s.vendor_id = 13269 AND s.product_key IS NULL THEN 'LG:LG9999'
+                WHEN s.vendor_id = 13263 AND s.product_key IS NULL THEN 'GE:GE9999'
+                WHEN s.vendor_id = 13276 AND s.product_key IS NULL THEN 'BOSCH:BOSCH9999'
+                WHEN s.vendor_id = 13264 AND s.product_key IS NULL THEN 'WHIRL:WHIRL9999'
+                WHEN s.vendor_id = 61570 AND s.product_key IS NULL THEN 'DAC:DAC9999'
+                WHEN s.vendor_id = 13517 AND s.product_key IS NULL THEN 'SNY:SNY9999'
+                WHEN s.vendor_id = 13550 AND s.product_key IS NULL THEN 'BEKO:BEKO9999'
+                WHEN s.vendor_id = 36527 AND s.product_key IS NULL THEN 'FORNO:FORNO9999'
+                WHEN s.vendor_id = 13412 AND s.product_key IS NULL THEN 'SAMSUNG:SAMSUNG9998'
+                WHEN s.vendor_id = 13607 AND s.product_key IS NULL THEN 'TCHNCLPRO:TCHNCLPRO9999'
+                WHEN s.vendor_id = 13259 AND s.product_key IS NULL THEN 'ELECTROLUX:ELECTROLUX9999'
+                WHEN s.vendor_id = 13267 AND s.product_key IS NULL THEN 'DAN:DAN9999'
+                WHEN s.vendor_id = 51128 AND s.product_key IS NULL THEN 'ZLINE:ZLINE9999'
+                WHEN s.vendor_id = 50625 AND s.product_key IS NULL THEN 'ELMTAPPL:ELMTAPPL9999'
+                WHEN s.vendor_id = 77860 AND s.product_key IS NULL THEN 'MIDDLEBY:MIDDLEBY9999'
+                WHEN s.vendor_id = 50148 AND s.product_key IS NULL THEN 'ELMIRA:ELMIRA9999'
+                WHEN s.vendor_id = 13571 AND s.product_key IS NULL THEN 'VER:VER9999'
+                WHEN s.vendor_id = 76658 AND s.product_key IS NULL THEN 'MRCOOL:MRCOOL9999'
+                WHEN s.vendor_id = 13619 AND s.product_key IS NULL THEN 'THRK:THRK9999'
+                WHEN s.vendor_id = 87584 AND s.product_key IS NULL THEN 'SUM:SUM9999'
+                WHEN s.vendor_id = 13415 AND s.product_key IS NULL THEN 'POLKA:POLKA9999'
+                WHEN s.vendor_id = 87381 AND s.product_key IS NULL THEN 'MASIMO:MASIMO9999'
+                WHEN s.vendor_id = 179172 AND s.product_key IS NULL THEN 'PHI:PHI9999'
+                when s.vendor_id = 97868 and s.product_key is null then 'ZEP:ZEP9999'
+                WHEN s.distributor_id = 13416 AND s.source_file_brand = 'Frigidaire' AND s.product_key IS NULL THEN 'FRIG:FRIG9999'
+                WHEN LEFT(s.source_file_brand,7)="AZIONE_" THEN CONCAT(RIGHT(source_file_brand,LENGTH(source_file_brand)-7),":",RIGHT(source_file_brand,LENGTH(source_file_brand)-7),9999) --new azione logic Added 23-02-22 Requested by Stakeholder (changed logic from ltrim to right 2023-03-08)
+                ELSE s.product_key
+                END AS product_key,
+            coalesce(s.demo_id, fei_am.demo_id, 0) as demo_id
+        ),
+        EXTRACT(YEAR FROM s.date) AS year,
+        EXTRACT(MONTH FROM s.date) AS month,
+        IFNULL(wa.account_type, 'Retail') AS account_type,
+        IF(s.distributor_id IS NULL,'DIRECT','DISTRIBUTION') AS channel, -- Stakeholder - Added: 23-03-30 - requested by Stakeholder/Stakeholder
+        IF(lower(s.source_file_brand) like '%azione%', TRUE, FALSE) as is_azione,
+        IF(lower(s.source_file_brand) like '%oasys%', TRUE, FALSE) as is_oasys, -- 2025-05-19 | Stakeholder request
+        IF(lower(s.source_file_brand) like '%ellipsys%', TRUE, FALSE) as is_ellipsys, -- 2025-05-19 | Stakeholder request
+        if(regexp_contains(source_file_brand,r'^(AZIONE_|ELLIPSYS_|OASYS_)'),true,false) as is_ci,
+        IF(LEFT(s.account_number, 1) = '2' AND vendor_id = 13264, TRUE, FALSE) AS is_contractor -- 2025-11-24 | Requested new field
+    from auth_accounts s
+    left join fei_am -- Stakeholder - Added: 2025-04-18 - this is a temporary patch for fei auth accounts; corresponds to a coalesce on demo_id above
+        on s.account_number = fei_am.account_number
+    LEFT JOIN demo_sources.whirlpool_account_types wa
+        ON LOWER(s.account_number) = LOWER(wa.account_number)
+    WHERE vendor_id IS NULL OR vendor_id!=50 -- this id probably needs to be updated, or tihs needs removed
+),
+
+tvs AS (
+    SELECT
+    ven_fix.*,
+    CASE
+        WHEN ven_fix.vendor_id = tvs_v.vendor_id THEN tvs_v.is_team_support
+        WHEN ven_fix.distributor_id = tvs_d.distributor_id THEN tvs_d.is_team_support
+        ELSE FALSE
+    END AS is_team_support
+    FROM ven_fix
+    LEFT JOIN demo_staging.team_support_vendors tvs_v
+        ON ven_fix.vendor_id = tvs_v.vendor_id
+    LEFT JOIN demo_staging.team_support_vendors tvs_d
+        ON ven_fix.distributor_id = tvs_v.distributor_id
+),
+
+final as (
+    SELECT *
+    FROM tvs
+    where
+        not (provider = '13416' and ifnull(product_key,'') like 'SPQ:%') -- removes speed queen from ourourke
+        and not (provider='13416' and lower(source_file_brand) in ('samsung','samsung appliances')) -- removes samsung appliances/electronics from orourke
+)
+
+select * from final

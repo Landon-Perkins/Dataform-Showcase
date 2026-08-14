@@ -1,0 +1,174 @@
+config {
+  type: "table",
+  name: "customer",
+  schema: "demo_reporting",
+  description: "Customer data from demo_platform",
+  tags: [
+    "crm_netsuite",
+    "crm_netsuite_pbi",
+    "p_bi 1 hour"
+  ],
+  bigquery: {
+    labels: {
+      scheduler: "dataform",
+      frequency: "",
+      author: "Stakeholder"
+    }
+  },
+  dependencies: [],
+  dependOnDependencyAssertions: true,
+  columns: {
+    is_member: "1 if customer has >= 1 active membership subscription",
+    is_dual_member: "1 if customer has >= 2 distinct active parent membership service groups",
+    is_website: "1 if customer has >= 1 active website subscription",
+    is_digital_marketing: "1 if customer has >= 1 active digital marketing subscription",
+    is_digital_member: "1 if customer has active membership AND >= 1 active digital service (website, web service, or digital marketing)",
+    highest_ranked_website_subscription_name: "Name of the highest ranked ACTIVE(no subscription end date) website subscription for each customer. Ranks are defined in demo_staging.website_subscription_rank based on internal business value of each subscription (generally higher price point means higher value)."
+  },
+  assertions: {
+    uniqueKey: ["customer_id"]
+  }
+}
+
+
+-- Change Log
+-- 2026-05-22 | Stakeholder | Added 5 binary (1/0) membership/digital flags: is_member, is_dual_member,
+--                       is_website, is_digital_marketing, is_digital_member
+
+WITH
+-- 1 row per customer: is_member (>=1 active membership sub),
+-- dual_member (>=2 distinct active parent membership service groups)
+-- active = end_date >= today or null (open-ended)
+membership_flags AS (
+  SELECT
+    customer_id,
+    CASE
+      WHEN COUNTIF(
+        membership_subscription_end_date >= CURRENT_DATE()
+        OR membership_subscription_end_date IS NULL
+      ) >= 1 THEN 1
+      ELSE 0
+    END AS is_member,
+    CASE
+      WHEN COUNT(
+        DISTINCT CASE
+          WHEN
+            membership_subscription_end_date >= CURRENT_DATE()
+            OR membership_subscription_end_date IS NULL
+            THEN parent_membership_service_id -- count service groups, not subscription lines
+        END
+      ) >= 2 THEN 1
+      ELSE 0
+    END AS dual_member
+  FROM ${ref("demo_staging_netsuite", "customer_membership_subscriptions")}
+  GROUP BY customer_id
+),
+
+-- 1 row per customer: is_website (>=1 active website sub)
+website_flags AS (
+  SELECT
+    customer_id,
+    CASE
+      WHEN COUNTIF(
+        website_subscription_end_date >= CURRENT_DATE()
+        OR website_subscription_end_date IS NULL
+      ) >= 1 THEN 1
+      ELSE 0
+    END AS is_website
+  FROM ${ref("demo_staging_netsuite", "customer_website_subscriptions")}
+  GROUP BY customer_id
+),
+
+-- 1 row per customer: is_digital_marketing (>=1 active digital marketing sub)
+digital_marketing_flags AS (
+  SELECT
+    customer_id,
+    CASE
+      WHEN COUNTIF(
+        digital_marketing_subscription_end_date >= CURRENT_DATE()
+        OR digital_marketing_subscription_end_date IS NULL
+      ) >= 1 THEN 1
+      ELSE 0
+    END AS is_digital_marketing
+  FROM ${ref("demo_staging_netsuite", "customer_digital_marketing_subscriptions")}
+  GROUP BY customer_id
+),
+
+-- distinct customer_ids with >=1 active digital service of any type
+-- (website, web service, or digital marketing) -- used to derive is_digital_member
+has_active_digital AS (
+  SELECT customer_id
+  FROM ${ref("demo_staging_netsuite", "customer_website_subscriptions")}
+  WHERE
+    website_subscription_end_date >= CURRENT_DATE()
+    OR website_subscription_end_date IS NULL
+
+  UNION DISTINCT
+
+  SELECT customer_id
+  FROM ${ref("demo_staging_netsuite", "customer_web_service_subscriptions")}
+  WHERE
+    web_service_subscription_end_date >= CURRENT_DATE()
+    OR web_service_subscription_end_date IS NULL
+
+  UNION DISTINCT
+
+  SELECT customer_id
+  FROM ${ref("demo_staging_netsuite", "customer_digital_marketing_subscriptions")}
+  WHERE
+    digital_marketing_subscription_end_date >= CURRENT_DATE()
+    OR digital_marketing_subscription_end_date IS NULL
+),
+
+core_plus AS (
+  SELECT
+    c.*,
+    COALESCE(mf.is_member, 0) AS is_member,
+    COALESCE(mf.dual_member, 0) AS is_dual_member,
+    COALESCE(wf.is_website, 0) AS is_website,
+    COALESCE(dmf.is_digital_marketing, 0) AS is_digital_marketing,
+    -- is_digital_member: must have active membership AND >=1 active digital service
+    CASE
+      WHEN
+        COALESCE(mf.is_member, 0) = 1
+        AND had.customer_id IS NOT NULL
+        THEN 1
+      ELSE 0
+    END AS is_digital_member,
+    CONCAT("https://5184885.app.demo_platform.com/app/common/entity/custjob.nl?id=", c.netsuite_id) AS netsuite_link
+  FROM ${ref("demo_staging_netsuite", "customer")} AS c
+  LEFT JOIN membership_flags AS mf
+    ON c.customer_id = mf.customer_id
+  LEFT JOIN website_flags AS wf
+    ON c.customer_id = wf.customer_id
+  LEFT JOIN digital_marketing_flags AS dmf
+    ON c.customer_id = dmf.customer_id
+  LEFT JOIN has_active_digital AS had
+    ON c.customer_id = had.customer_id
+),
+
+website_sub_rank AS (
+  SELECT
+    c.*,
+    ws.highest_ranked_webstite_subscription_name
+  FROM core_plus AS c
+  -- below join is to pull in the highest ranked website subscription for each customer
+  LEFT JOIN (
+    SELECT
+      customer_id,
+      website_subscription_name AS highest_ranked_webstite_subscription_name
+    FROM ${ref("demo_staging_netsuite", "customer_website_subscriptions")}
+    WHERE
+      website_subscription_end_date IS NULL
+    QUALIFY
+      ROW_NUMBER() OVER (
+        PARTITION BY customer_id
+        ORDER BY website_subscription_reverse_rank DESC
+      ) = 1
+  ) AS ws
+    ON c.customer_id = ws.customer_id
+)
+
+SELECT 
+  *
+FROM website_sub_rank

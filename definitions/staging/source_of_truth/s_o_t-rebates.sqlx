@@ -1,0 +1,200 @@
+config { type: "table",
+        name: "rebates",
+        schema: "demo_staging",
+        description: "Rebate transaction staging layer with program matching, product normalization, and claim-level enrichment.",
+        dependOnDependencyAssertions: true,
+        assertions: {
+          uniqueKey: ["transaction_id"]
+        },
+        tags: ["demo_staging",
+        // "s_o_t daily"
+        ]
+        }
+-- Change Log
+-- 23-11-08 | Stakeholder added 0 to remove duplicates
+-- 25-01-30 | Stakeholder | added insights dealer ID and demo_id mapping to align outdated values.
+-- 25-08-22 | Stakeholder added DISTINCT to remove duplicates. Occasionally the source data has duplicate records due to a processing issue on the ETL side.
+-- 2025-12-08 | Stakeholder | demo_platform vendor rework updates
+-- 2026-01-27 | Stakeholder | Deprecated join to locations table for demo_id retrieval.
+-- 2026-03-01 | Stakeholder | Rewkork of holiday event handling to break depedency on rebate google sheet.
+-- 2026-03-09 | Stakeholder | deprecated `item_claim` - bonus driven amounts are no longer a desired datum @Stakeholder
+-- 2026-03-16 | Stakeholder | Reordered holiday_event CASE WHEN clauses by priority rank to resolve name-based match conflicts predictably.
+
+WITH
+start_end_dates AS (
+  SELECT DISTINCT
+    code,
+    ARRAY_AGG(start_date)[OFFSET(0)] AS start_date,
+    ARRAY_AGG(end_date)[OFFSET(0)] AS end_date
+  -- FROM ${ref("demo_sources", "rebate_programs")} -- 2026-03-09 | Stakeholder
+  FROM ${ref("demo_staging", "rebate_programs")} -- 2026-03-09 | Stakeholder | switched to source of truth version of rebate programs to capture status and ensure alignment with holiday program flags
+  GROUP BY code
+),
+
+bonus_product_keys AS (
+  SELECT
+    bonus_transaction_id,
+    ARRAY_AGG(product_key)[OFFSET(0)] AS product_key
+  FROM ${ref("demo_sources", "rebates")}
+  WHERE product_key IS NOT NULL
+  GROUP BY bonus_transaction_id
+),
+
+rebates AS (
+  SELECT DISTINCT -- 2025-08-22 | Stakeholder added DISTINCT to remove duplicates
+    r.transaction_id,
+    CASE
+      WHEN m.demo_id IS NULL THEN r.demo_id
+      ELSE m.demo_id
+    END AS demo_id,
+    IF(r.is_bonus, bpk.product_key, r.product_key) AS product_key,
+    r.created_date AS rebate_created_date,
+    r.sale_date,
+    r.delivery_date,
+    r.customer_first_name,
+    r.customer_last_name,
+    CONCAT(r.customer_first_name, ' ', r.customer_last_name) AS customer_name,
+    r.invoice_number,
+    r.claim_amount,
+    r.status AS rebate_status,
+    r.reason AS decline_reason,
+    r.program_type,
+    r.program_code,
+    r.bonus_program_name,
+    r.is_bonus,
+    r.bonus_transaction_id,
+    r.quantity,
+    r.customer_email,
+    r.paid_date,
+    r.approved_date,
+    r.sell_price,
+    r.submission_method,
+    r.affiliate_demo_id,
+    r.location,
+    r.insights_dealer_id,
+    r.insights_brand,
+    r.insights_pn,
+    r.insights_serial_number,
+    r.batch_id,
+    r.program_name,
+    CASE
+      WHEN REGEXP_CONTAINS(r.program_code, '^demo') THEN 'demo Exclusive'
+      WHEN REGEXP_CONTAINS(r.program_code, '^[A-Z]{2,3}') THEN 'Member Rebate'
+      ELSE 'Manufacturer Rebate'
+    END AS rebate_type,
+    sed.start_date AS program_start_date,
+    sed.end_date AS program_end_date,
+  FROM ${ref("demo_sources", "rebates")} AS r
+  LEFT JOIN ${ref("demo_sources", "member_locations")} locs
+    USING (location_no)
+  LEFT JOIN ${ref("demo_sources", "members")} m
+    ON m.id = locs.member_id
+  LEFT JOIN start_end_dates AS sed
+    ON r.program_code = sed.code
+  LEFT JOIN bonus_product_keys AS bpk
+    ON
+      r.is_bonus
+      AND r.transaction_id = bpk.bonus_transaction_id
+  WHERE r.demo_id NOT IN (3, 0) OR r.demo_id IS NULL
+),
+
+key_claim_corrections AS (
+  SELECT
+    r.* EXCEPT (product_key),
+    IF(LEFT(COALESCE(p.key, r.product_key), 3) = 'CA_', LTRIM(COALESCE(p.key, r.product_key), 'CA_'), COALESCE(p.key, r.product_key)) AS product_key,--Stakeholder edit 12/29/2022 to prevent canada products  from sneaking in ,
+    claim_amount AS item_claim,
+    IF(UPPER(r.program_code) LIKE 'demo%', TRUE, FALSE) AS demo_program,
+  FROM rebates AS r
+  LEFT JOIN ${ref("demo_staging", "products")} AS p
+    ON r.product_key = p.original_key
+),
+
+correction_enh AS (
+SELECT
+  cor.* EXCEPT (product_key, demo_id),
+  COALESCE(cor.demo_id, maps.demo_id, 0) AS demo_id,
+  CASE
+    WHEN insights_brand = 'Installation' THEN 'DEMO_GENERIC:INSTALL'
+    WHEN insights_brand = 'Delivery' THEN 'DEMO_GENERIC:DELIVERY'
+    WHEN insights_brand = 'AT&T' THEN 'DEMO_GENERIC:DEMO_GENERIC9999'
+    WHEN insights_brand = 'Customer Pick Up' THEN 'DEMO_GENERIC:DEMO_GENERIC9999'
+    WHEN insights_brand = 'DIRECTV' THEN 'DEMO_GENERIC:DEMO_GENERIC9999'
+    WHEN insights_brand = 'Extended Warranty' THEN 'DEMO_GENERIC:WARRANTY'
+    WHEN insights_brand = 'Protection Plan' THEN 'DEMO_GENERIC:WARRANTY'
+    ELSE product_key
+  END AS product_key
+FROM key_claim_corrections cor
+LEFT JOIN ${ref("demo_staging", "insights_dealer_ids_to_demo_ids_mapping")} AS maps USING (insights_dealer_id)
+),
+
+holidays_and_vendors AS (
+  -- 2026-03-01 | Stakeholder
+  SELECT
+    ce.*,
+    -- 2026-03-16 | Stakeholder | reordered by priority rank so higher-priority events win on any name overlap
+    --                     | The rank is based on priority for classification when multiple events could match a program name. (Ranks originally created by Stakeholder)
+    rp.holiday_event,
+    rp.holiday_priority_rank,
+    IF(rp.holiday_event = 'NON HOLIDAY PROMO', NULL, ce.program_code) as holiday_p_code,
+    IF(rp.holiday_event = 'NON HOLIDAY PROMO', NULL, ce.program_name) as holiday_p_name,
+    CASE
+      WHEN program_name LIKE '%GE%' THEN 13263
+      WHEN program_name LIKE '%Monogram%' THEN 50738
+      WHEN program_name LIKE '%Whirlpool%' OR program_name LIKE '%KitchenAid%' OR program_name LIKE '%Maytag%' OR program_name LIKE '%MYG%' THEN 13264
+      WHEN program_name LIKE '%Samsung%' THEN 13412
+      WHEN program_name LIKE '%Electrolux%' OR program_name LIKE '%Frigidaire%' THEN 13259
+      WHEN program_name LIKE '%LG%' THEN 13269
+      WHEN program_name LIKE '%Beko%' OR program_name LIKE '%BEKO%' THEN 13550
+      WHEN program_name LIKE '%Speed Queen%' THEN 13413
+      WHEN program_name LIKE '%JennAir%' THEN 71916
+      WHEN program_name LIKE '%Energy%' OR program_name LIKE '%ENERGY%' THEN 124225
+      WHEN program_name LIKE '%Sharp%' THEN 36450
+      WHEN program_name LIKE '%Bosch%' THEN 13276
+      WHEN program_name LIKE '%Beautyrest%' THEN 13463
+      WHEN program_name LIKE '%Stearns%' THEN 13494
+      WHEN program_name LIKE '%TSI%' THEN 13494
+      WHEN program_name LIKE '%TEMPUR-PEDIC%' THEN 13255
+      WHEN program_name LIKE '%Outdoor%' OR program_name LIKE '%GRILL%' THEN 124230
+      WHEN program_name LIKE '%Dacor%' THEN 13412
+      WHEN program_name LIKE '%TV%' THEN 124228
+      ELSE 124225
+      END as vendor_id
+  FROM correction_enh ce
+  LEFT JOIN ${ref("demo_staging", "rebate_programs")} rp
+    ON ce.program_code = rp.code
+  ),
+
+holiday_dates_and_name AS (
+  SELECT
+    hv.* REPLACE(
+      CASE
+        WHEN hv.holiday_event != 'NON HOLIDAY PROMO' THEN hv.holiday_event
+        WHEN hv.program_start_date = pmap.event_start_date
+          AND hv.program_end_date = pmap.event_end_date THEN pmap.event_name
+        ELSE 'NON HOLIDAY PROMO'
+      END AS holiday_event
+    ),
+    pmap.event_start_date AS holiday_start_date,
+    pmap.event_end_date AS holiday_end_date,
+  FROM holidays_and_vendors hv
+  LEFT JOIN ${ref("demo_staging", "pmap")} pmap
+    ON extract(year from hv.program_start_date) = pmap.year
+    AND hv.holiday_event = pmap.event_name
+),
+
+verticals as (
+  SELECT
+    h.*,
+    CASE
+      WHEN nv.general_category = 'Luxury Appliances' THEN 'Appliances'
+      ELSE nv.general_category
+      END as holiday_vertical
+  FROM holiday_dates_and_name h
+  LEFT JOIN ${ref("demo_staging_netsuite", "netsuite_vendors")} nv
+    ON h.vendor_id = nv.id
+    AND h.holiday_event != 'NON HOLIDAY PROMO'
+)
+
+SELECT
+  *
+FROM verticals

@@ -1,0 +1,19 @@
+config { type: "incremental",
+         name: "locations_snapshots",
+         schema: "demo_sources",
+        tags: ["snapshot"],
+        }
+
+pre_operations {
+    declare fields default (
+            SELECT STRING_AGG(column_name,',\n')||"," 
+            FROM aggdata.INFORMATION_SCHEMA.COLUMNS 
+            WHERE table_name = 'locations'
+            )
+}
+
+
+SELECT
+    fields,
+    CURRENT_DATETIME('America/New_York') AS snapshot_date_us_east
+FROM ${ref("aggdata","locations")}

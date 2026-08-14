@@ -1,0 +1,139 @@
+config {
+    type: "assertion",
+    tags: ["pos"],
+    dependencies: ["d_w-mso_raw_load_z_score_log"]
+}
+
+-- Change Log
+-- 2026-05-01 | Stakeholder | Initial build
+-- 2026-05-01 | Stakeholder | Switched from per-file to daily batch aggregation to avoid splitting
+--                      multi-file batch events into many small baseline data points
+
+-- Purpose:
+--   Flags demo_ids where the most recent daily batch delivery to dw.mso_raw is anomalous
+--   compared to the distribution of all prior daily batch totals over the last 6 months.
+--   Uses DATE(raw_import_date_time) as the batch identifier; all files delivered on the
+--   same calendar day by a member are summed into one data point. This correctly handles
+--   members who deliver multiple files per day as a single batch event.
+--   Members with fewer than 10 historical daily batches are skipped (insufficient baseline).
+--   Intended as a pre-load gate: if this assertion fails, the member gets excluded
+--   from the sot.member_sale_outs pipeline until resolved.
+
+-- Methodology:
+-- 1: Aggregate per (demo_id, DATE(raw_import_date_time)) to get daily batch totals.
+--    Window: last 6 complete months on transaction date.
+-- 2: Identify the current batch as MAX(load_date) globally per demo_id.
+-- 3: Compute historical baseline from all prior daily batches, excluding the current
+--    day to prevent self-contamination of the stddev.
+-- 4: Compute per-demo_id mean, stddev, and batch count from historical batches.
+-- 5: Compare current batch totals against historical stats.
+--    z = (current_total - historical_mean) / historical_stddev
+--    Flag if ABS(z_units) > 3 OR ABS(z_volume) > 3 AND load_count >= 10.
+
+-- Window:
+--   WINDOW_START : DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL 6 MONTH), MONTH)
+--   WINDOW_END   : CURRENT_DATE() -- inclusive of today's loads
+
+WITH
+-- 1: Daily batch totals per demo_id.
+--    Each row represents one calendar day of deliveries from one member.
+--    Multiple files delivered on the same day are summed into a single data point.
+--    Filtered to last 6 months on transaction date.
+load_increments AS (
+    SELECT
+        demo_id,
+        DATE(raw_import_date_time) AS load_date,
+        SUM(units) AS load_units,
+        SUM(price) AS load_volume
+    FROM `demo-project.demo_sources.member_sale_outs_raw`
+    WHERE
+        date >= DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL 6 MONTH), MONTH)
+        AND demo_id IS NOT NULL
+    GROUP BY ALL
+),
+
+-- 2: Identify the current (most recent) daily batch per demo_id.
+current_load AS (
+    SELECT
+        demo_id,
+        load_date AS current_load_date,
+        load_units AS current_units,
+        load_volume AS current_volume
+    FROM load_increments
+    QUALIFY load_date = MAX(load_date) OVER (PARTITION BY demo_id)
+),
+
+-- 3: All prior daily batches per demo_id, excluding the current day.
+--    This is the baseline population used to compute each member's stddev.
+historical_loads AS (
+    SELECT
+        li.demo_id,
+        li.load_date,
+        li.load_units,
+        li.load_volume
+    FROM load_increments AS li
+    INNER JOIN current_load AS cl
+        ON li.demo_id = cl.demo_id
+        AND li.load_date != cl.current_load_date
+),
+
+-- 4: Per-demo_id stats from historical daily batches.
+--    load_count is the number of prior delivery days in the 6-month window.
+historical_stats AS (
+    SELECT
+        demo_id,
+        AVG(load_units) AS mean_units,
+        STDDEV(load_units) AS std_units,
+        AVG(load_volume) AS mean_volume,
+        STDDEV(load_volume) AS std_volume,
+        COUNT(*) AS load_count
+    FROM historical_loads
+    GROUP BY demo_id
+),
+
+-- 5: Compare current load against historical baseline per demo_id.
+--    INNER JOIN: only evaluate members present in both current and historical loads.
+--    SAFE_DIVIDE: returns null (no flag) if stddev is 0 or null.
+comparison AS (
+    SELECT
+        cl.demo_id,
+        cl.current_load_date,
+        cl.current_units,
+        cl.current_volume,
+        hs.mean_units,
+        hs.std_units,
+        hs.mean_volume,
+        hs.std_volume,
+        hs.load_count,
+        SAFE_DIVIDE(cl.current_units - hs.mean_units, hs.std_units) AS z_units,
+        SAFE_DIVIDE(cl.current_volume - hs.mean_volume, hs.std_volume) AS z_volume
+    FROM current_load AS cl
+    INNER JOIN historical_stats AS hs
+        ON cl.demo_id = hs.demo_id
+),
+
+final AS (
+    SELECT
+        demo_id,
+        current_load_date,
+        current_units,
+        ROUND(current_volume, 2) AS current_volume,
+        ROUND(mean_units, 2) AS mean_units,
+        ROUND(mean_volume, 2) AS mean_volume,
+        ROUND(std_units, 2) AS std_units,
+        ROUND(std_volume, 2) AS std_volume,
+        load_count,
+        ROUND(z_units, 4) AS z_units,
+        ROUND(z_volume, 4) AS z_volume,
+        CASE
+            WHEN ABS(z_units) > 3 AND ABS(z_volume) > 3 THEN "units and volume anomaly"
+            WHEN ABS(z_units) > 3 THEN "units anomaly"
+            WHEN ABS(z_volume) > 3 THEN "volume anomaly"
+        END AS anomaly_type
+    FROM comparison
+    WHERE
+        (ABS(z_units) > 3 OR ABS(z_volume) > 3)
+        AND load_count >= 10
+)
+
+SELECT * FROM final

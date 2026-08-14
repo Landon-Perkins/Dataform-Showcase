@@ -1,0 +1,1185 @@
+config {type: "operations",
+        name: "customer_membership_reporting",
+        schema: "demo_reporting",
+        hasOutput: true,
+        tags: [
+          "membership_reporting",
+          "membership",
+          "crm_netsuite",
+          "crm_netsuite_pbi",
+          "p_bi 1 hour"],
+        dependOnDependencyAssertions: true,
+        columns: {
+          demo_id_str: "Field demo_id converted to STRING for Power BI use.",
+          parent_id_change: "Refers to the parent child relationship between dealers (if a company got bought out by another company or something)"
+          }
+}
+-- demo_staging_netsuite.membership_reporting
+-- Purpose: Create membership_reporting using a two part build process.
+--          This is needed due to the complexity of the SQL overloading the BQ Query Builder.
+-- Process: Create temp table. Create final table from temp table. Update final table with corrections xref.
+-- Change log:
+--  2023-09-01  | Stakeholder  | commented out OUTDOOR and DISTRIBUTION rename logic
+--  2023-09-05  | Stakeholder  | added OUTDOOR and DISTRIBUTION CASE logic
+--  2023-09-06  | Stakeholder  | added WESTERN logic for specific members. c_date <= "2023-08-31" is used to account for possible reactivation
+--  2023-09-06  | Stakeholder  | Added logic to accomadate when date = effective_date_membership and bb change
+--  2023-09-11  | Stakeholder  | Added logic for FEI Linked members to not be included in bod
+--  2023-09-13  | Stakeholder  | Removed partial logic from add_dealer and delete_dealer
+--  2023-09-15  | Stakeholder  | Added exceptions for Florida division and group movement
+--  2023-09-19  | Stakeholder  | Added more exceptions for Florida group and division changes
+--  2023-09-21  | Stakeholder  | Added logic for demo_id IN(114038,113729) division and group changes
+--  2023-10-24  | Stakeholder  | Added logic to fix OASYS - All the Oasys members should not show any moves into the Division.
+--                          If a member is Oasys as of today (even if the account is terminated) it has be have been always Oasys
+--                          Added logic for demo_id 2274 - Should be western and never have moved to Oasys
+-- 2023-10-25   | Stakeholder  | Added logic for demo_id 105135, 113497
+-- 2024-02-15 | Stakeholder | An issue arose where members weren't being captured in snapshots until several months after they became members.
+--                      This caused NULL values in division_name. Hardcoding the CASE statement was the fix because those specific divisions will never change.
+-- 2024-02-15 | Stakeholder | An issue with brand builder logic needed to be fixed. The business rule states
+--                      "once a brand builder always a brand builder". bb_fix_1 and bb_fix_2 implement this by wrapping the entire table and globally setting the
+--                      brand_builder and group_bod with CASE statements.
+-- 2024-09-06 | Stakeholder | Hardcoded additional members to the division_name CASE statement (see 2024-02-15 change)
+-- 2025-01-03 | Stakeholder | The Florida fix is no longer needed as they will be Associate throughout time.
+--                      Added FEI group and name for specific members.
+-- 2025-06-26 | Stakeholder | Added field_rep_on_date and field_rep_on_prev_date to the final table.
+--                        !FOLLOW THESE CHANGES TO ADD SIMILAR ON_DATE AND ON_PREV_DATE FIELDS.
+-- 2025-07-03 | Stakeholder | Added regional_role_on_date and regional_role_on_prev_date to the final table.
+--                        !FOLLOW THESE CHANGES TO ADD SIMILAR ON_DATE AND ON_PREV_DATE FIELDS AND BY_QUARTER DATES
+-- 2026-05-22 | Stakeholder | Dropped regional_role - will not be used in new CRM tables
+-- 2026-07-31 | Stakeholder | Reworked brand builder dates to be derived from CRM subscription dates.
+
+CREATE OR REPLACE TEMP TABLE mrtemp AS(
+  WITH
+  calendar_array AS (
+    SELECT
+      GENERATE_DATE_ARRAY("2017-01-01",CURRENT_DATE(),INTERVAL 1 month) dates),
+  calendar AS (
+    SELECT
+      LAST_DAY(date,month) AS c_date
+    FROM calendar_array, UNNEST(dates) date),
+  brand_builder_periods AS (
+    SELECT
+      SAFE_CAST(customer_id AS INT64) AS demo_id,
+      membership_subscription_start_date AS brand_builder_start_date,
+      membership_subscription_end_date AS brand_builder_end_date
+    FROM ${ref(
+      "demo_staging_netsuite",
+      "customer_membership_subscriptions"
+    )}
+    WHERE membership_subscription_name_id = 2006
+  ),
+  members_raw_snapshots AS (
+    SELECT
+      DATE(snapshot_date_us_east) AS date,
+      demo_id AS id,
+      division_id,
+      field_rep, -- 2025-06-26 | Stakeholder
+      -- regional_role, -- 2025-07-03 | Stakeholder
+      parent_id,
+      is_brand_builder,
+      effective_date_membership,
+      termination_date,
+      -- NULL AS termination_group, -- 2026-06-11 | Stakeholder | Didn't seem to be used. Dropped.
+      NULL AS membership_subscription_id, -- 2026-05-05 | Stakeholder | Added
+      ROW_NUMBER()
+        OVER (PARTITION BY demo_id,
+          DATE(snapshot_date_us_east)
+          ORDER BY snapshot_date_us_east DESC) AS row_no,
+    FROM `demo-project.demo_staging_netsuite.membership_reporting_driver_snapshots` -- DO NOT change to ${ref()}
+    WHERE (DATE(snapshot_date_us_east) = LAST_DAY(snapshot_date_us_east,month)
+      OR snapshot_date_us_east = (SELECT
+                                    MAX(snapshot_date_us_east)
+                                  FROM `demo-project.demo_staging_netsuite.membership_reporting_driver_snapshots`))),-- DO NOT change to ${ref()}
+  first_rows AS (
+    SELECT
+      raw.* EXCEPT(row_no, effective_date_membership, termination_date)
+    FROM members_raw_snapshots raw
+    WHERE raw.row_no=1),
+  raw_members AS (
+    SELECT
+      m.demo_id AS id,
+      m.demo_id,
+      m.is_brand_builder,
+      m.termination_date,
+      m.effective_date_membership,
+      m.division_id,
+      m.field_rep, -- 2025-06-26 | Stakeholder
+      -- m.regional_role, -- 2025-07-03 | Stakeholder
+      m.mms_termination_reason,
+      m.parent_id,
+      m.linked_member, --  2023-09-11  | Stakeholder  | Added logic for FEI Linked members to not be included in bod
+      m.membership_subscription_id, -- 2026-05-05 | Stakeholder | Added
+      bb.brand_builder_start_date, -- 2026-07-31 | bb fields added for CRM brand builder sub dates
+      bb.brand_builder_end_date
+    FROM ${ref("demo_staging_netsuite", "membership_reporting_driver")} m
+    LEFT JOIN brand_builder_periods AS bb
+      USING (demo_id)
+    WHERE demo_id!=0
+      AND demo_id IS NOT NULL ),
+  paf AS (
+    SELECT
+      DISTINCT netsuite_division_name AS division_name,
+      NULL AS division_parent_name,
+      NULL AS division_parent_parent_name,
+      NULL AS child_division_name,
+      division_id AS id
+    FROM ${ref("demo_staging_netsuite", "membership_reporting_driver")}
+    WHERE netsuite_division_name IS NOT NULL),
+  divisions AS (
+    SELECT
+      id,
+      id AS division_id,
+      division_name,
+      division_parent_name AS affiliate_1,
+      child_division_name AS affiliate_2
+    FROM paf),
+  changes AS (
+    SELECT
+      cur.date,
+      cur.id,
+      cur.division_id AS division_id_on_date,
+      prev.division_id AS division_id_on_prev_date,
+      CASE
+        WHEN IFNULL(cur.division_id,0)!=IFNULL(prev.division_id,0) THEN TRUE
+        ELSE FALSE
+        END AS division_change,
+      cur.parent_id AS parent_id_on_date,
+      prev.parent_id AS parent_id_on_prev_date,
+      CASE
+        WHEN IFNULL(cur.parent_id,0)!=IFNULL(prev.parent_id,0) THEN TRUE
+        ELSE FALSE
+        END AS parent_id_change,
+      cur.field_rep AS field_rep_on_date, -- 2025-06-26 | Stakeholder
+      prev.field_rep AS field_rep_on_prev_date, -- 2025-06-26 | Stakeholder
+      CASE
+        WHEN IFNULL(cur.field_rep,"")!=IFNULL(prev.field_rep,"") THEN TRUE
+        ELSE FALSE
+        END AS field_rep_change, -- 2025-06-26 | Stakeholder
+      -- cur.regional_role AS regional_role_on_date, -- 2025-07-03 | Stakeholder
+      -- prev.regional_role AS regional_role_on_prev_date, -- 2025-07-03 | Stakeholder
+      -- CASE
+      --   WHEN IFNULL(cur.regional_role,"")!=IFNULL(prev.regional_role,"") THEN TRUE
+      --   ELSE FALSE
+      --   END AS regional_role_change, -- 2025-07-03 | Stakeholder
+      -- cur.is_brand_builder AS brand_builder_on_date, -- 2026-07-31 | Removed, no longer snapshot derived for CRM updates.
+      -- prev.is_brand_builder AS brand_builder_on_prev_date,
+      -- CASE
+      --   WHEN cur.is_brand_builder!=prev.is_brand_builder THEN TRUE
+      --   ELSE FALSE
+      --   END AS brand_builder_change -- 2026-07-31 | Removed, no longer snapshot derived for CRM updates.
+    FROM first_rows cur
+    LEFT JOIN first_rows prev
+      ON DATE_TRUNC(prev.date, month) = DATE_SUB(DATE_TRUNC(cur.date,month), INTERVAL 1 month)
+        AND cur.id=prev.id ),
+  adds_deletes_and_active_status AS (
+    SELECT
+      *,
+      CASE
+        WHEN c_date = LAST_DAY(effective_date_membership, MONTH) THEN 1
+        ELSE 0
+        END AS add_dealer,
+      CASE
+        WHEN c_date = LAST_DAY(termination_date, MONTH) THEN -1
+        ELSE 0
+        END AS delete_dealer,
+      CASE
+        WHEN DATE_TRUNC(effective_date_membership, MONTH)
+          = DATE_TRUNC(termination_date, MONTH)
+          THEN 0
+        WHEN effective_date_membership <= c_date
+          AND IFNULL(termination_date, CURRENT_DATE()) > c_date
+          THEN 1
+        WHEN termination_date IS NULL
+          AND c_date = (
+            SELECT MAX(c_date)
+            FROM calendar
+          )
+          THEN 1
+        ELSE 0
+        END AS dealer_is_active_on_date,
+      CASE
+        WHEN brand_builder_start_date <= c_date
+          AND COALESCE(
+            brand_builder_end_date,
+            DATE '9999-12-31'
+          ) >= DATE_TRUNC(c_date, MONTH)
+          THEN TRUE
+        ELSE FALSE
+        END AS brand_builder_on_date,
+      CASE
+        WHEN brand_builder_start_date
+          <= LAST_DAY(
+            DATE_SUB(c_date, INTERVAL 1 MONTH),
+            MONTH
+          )
+          AND COALESCE(
+            brand_builder_end_date,
+            DATE '9999-12-31'
+          ) >= DATE_TRUNC(
+            DATE_SUB(c_date, INTERVAL 1 MONTH),
+            MONTH
+          )
+          THEN TRUE
+        ELSE FALSE
+        END AS brand_builder_on_prev_date,
+      CASE
+        WHEN (
+          brand_builder_start_date <= c_date
+          AND COALESCE(
+            brand_builder_end_date,
+            DATE '9999-12-31'
+          ) >= DATE_TRUNC(c_date, MONTH)
+        ) != (
+          brand_builder_start_date
+            <= LAST_DAY(
+              DATE_SUB(c_date, INTERVAL 1 MONTH),
+              MONTH
+            )
+          AND COALESCE(
+            brand_builder_end_date,
+            DATE '9999-12-31'
+          ) >= DATE_TRUNC(
+            DATE_SUB(c_date, INTERVAL 1 MONTH),
+            MONTH
+          )
+        )
+          THEN TRUE
+        ELSE FALSE
+        END AS brand_builder_change
+    FROM calendar
+    CROSS JOIN raw_members
+    ORDER BY c_date
+  ),
+  flagged_dealers_with_multiple_records AS (
+    SELECT
+      demo_id,
+      COUNT(*) AS record_count,
+      TRUE AS duplicate_dealer_flag
+    FROM raw_members
+    GROUP BY demo_id
+    HAVING record_count > 1 ),
+  flagged_calendar AS (
+    SELECT
+      adds_deletes.*,
+      IFNULL(duplicate_dealer_flag, FALSE) AS duplicate_dealer_flag
+    FROM adds_deletes_and_active_status adds_deletes
+    LEFT JOIN flagged_dealers_with_multiple_records AS flags
+      ON flags.demo_id=adds_deletes.demo_id ),
+  merged_calendar AS (
+    SELECT
+      flagged_calendar.*,
+      changes.* EXCEPT(id, date)
+    FROM flagged_calendar
+    LEFT JOIN changes
+      ON changes.id=flagged_calendar.id
+        AND DATE_TRUNC(changes.date,month) = DATE_TRUNC(flagged_calendar.c_date,month)),
+  max_calendar_date AS (
+    SELECT
+      MAX(c_date) AS max_date,
+      TRUE AS is_current_data
+    FROM merged_calendar ),
+  ns AS (
+    SELECT
+      merged_calendar.*,
+      divisions.division_name,
+      divisions.affiliate_1,
+      divisions.affiliate_2,
+      field_rep, -- 2025-06-26 | Stakeholder
+      -- regional_role, -- 2025-07-03 | Stakeholder
+      date_divs.division_name AS division_name_on_date,
+      prev_date_divs.division_name AS division_name_on_prev_date,
+      IFNULL(max_calendar_date.is_current_data,FALSE) AS is_current_data
+    FROM merged_calendar
+    LEFT JOIN max_calendar_date
+      ON max_calendar_date.max_date=merged_calendar.c_date
+    LEFT JOIN divisions
+      ON divisions.division_id=merged_calendar.division_id
+    LEFT JOIN divisions date_divs
+      ON date_divs.division_id=merged_calendar.division_id_on_date
+    LEFT JOIN divisions prev_date_divs
+      ON prev_date_divs.division_id=merged_calendar.division_id_on_prev_date),
+  mem AS (
+    SELECT
+      c_date AS date,
+      demo_id,
+      membership_subscription_id,
+      is_brand_builder,
+      termination_date,
+      effective_date_membership,
+      mms_termination_reason AS termination_reason,
+      parent_id,
+      add_dealer,
+      delete_dealer,
+      dealer_is_active_on_date,
+      division_change,
+      parent_id_on_date,
+      parent_id_on_prev_date,
+      parent_id_change,
+      brand_builder_on_date,
+      brand_builder_on_prev_date,
+      brand_builder_change,
+      -- CASE division_name | 23-08-23 Business Rule: division name has been changed from East to Eastern and West to Western. Must be upper for power bi.
+      CASE --  2023-09-05  | Stakeholder  | added OUTDOOR and DISTRIBUTION CASE logic
+        WHEN demo_id IN (1082, 1625, 1602, 6912, 1773, 1341, 1472, 1237, 1482, 1434) THEN "demo CORE"
+        WHEN UPPER(division_name) = 'EAST' THEN 'EASTERN'
+        WHEN UPPER(division_name) = 'WEST' THEN 'WESTERN'
+        WHEN c_date <= "2023-08-31" AND demo_id IN (8665, 8667, 8674, 8675, 8676, 8677, 8678, 8689, 8680, 8681, 8679) THEN 'DISTRIBUTION'
+        WHEN c_date <= "2023-08-31" AND demo_id IN (91000, 92001, 92004, 92003) THEN 'OUTDOOR'
+        WHEN c_date <= "2023-08-31" AND demo_id IN(107122, 113930, 114089,3529) THEN 'WESTERN' --Member in the Eastern on 1/1 and terminated in Western
+        WHEN c_date <= "2022-10-01" AND demo_id IN(6918, 6923, 6916, 6901, 6951, 6934, 6906, 6915, 6950, 6920, 6900, 6910,6946, 6948, 6933, 6917, 6904, 6908, 6940, 113729, 6938, 6914, 6912, 6939, 114038 ) THEN 'FLORIDA'
+        WHEN c_date > "2022-10-01" AND demo_id IN(6918, 6923, 6916, 6901, 6951, 6934, 6906, 6915, 6950, 6920, 6900, 6910) THEN 'EASTERN'
+        WHEN c_date BETWEEN "2022-10-31" AND "2023-09-30" AND demo_id IN(113729,114038) THEN "demo Core"  -- Stakeholder | 23-09-21
+        ELSE division_name
+        END AS division_name,
+      CASE --  2023-09-05  | Stakeholder  | added OUTDOOR and DISTRIBUTION CASE logic
+        WHEN demo_id IN (1082, 1625, 1602, 6912, 1773, 1341, 1472, 1237, 1482, 1434) THEN "demo CORE"
+        WHEN UPPER(division_name_on_date) = 'EAST' THEN 'EASTERN'
+        WHEN UPPER(division_name_on_date) = 'WEST' THEN 'WESTERN'
+        WHEN c_date <= "2023-08-31" AND demo_id IN (8665, 8667, 8674, 8675, 8676, 8677, 8678, 8689, 8680, 8681, 8679) THEN 'DISTRIBUTION'
+        WHEN c_date <= "2023-08-31" AND demo_id IN (91000, 92001, 92004, 92003) THEN 'OUTDOOR'
+        WHEN c_date <= "2023-08-31" AND demo_id IN(107122, 113930, 114089,3529) THEN 'WESTERN' --Member in the Eastern on 1/1 and terminated in Western
+        WHEN c_date <= "2022-10-01" AND demo_id IN(6918, 6923, 6916, 6901, 6951, 6934, 6906, 6915, 6950, 6920, 6900, 6910,6946, 6948, 6933, 6917, 6904, 6908, 6940, 113729, 6938, 6914, 6912, 6939, 114038 ) THEN 'FLORIDA'
+        WHEN c_date > "2022-10-01" AND demo_id IN(6918, 6923, 6916, 6901, 6951, 6934, 6906, 6915, 6950, 6920, 6900, 6910) THEN 'EASTERN'
+        WHEN c_date BETWEEN "2022-10-31" AND "2023-09-30" AND demo_id IN(113729,114038) THEN "demo Core"  -- Stakeholder | 23-09-21
+        WHEN c_date <= "2023-10-31" AND demo_id = 113497 THEN 'EASTERN' -- 23-10-25 | Stakeholder
+        WHEN c_date <= "2023-10-31" AND demo_id = 105135 THEN 'WESTERN' -- 23-10-25 | Stakeholder
+        ELSE division_name_on_date
+        END AS division_name_on_date,
+      CASE --  2023-09-05  | Stakeholder  | added OUTDOOR and DISTRIBUTION CASE logic
+        WHEN demo_id IN (1082, 1625, 1602, 6912, 1773, 1341, 1472, 1237, 1482, 1434) THEN "demo CORE"
+        WHEN UPPER(division_name_on_prev_date) = 'EAST' THEN 'EASTERN'
+        WHEN UPPER(division_name_on_prev_date) = 'WEST' THEN 'WESTERN'
+        WHEN c_date <= "2023-08-31" AND demo_id IN (8665, 8667, 8674, 8675, 8676, 8677, 8678, 8689, 8680, 8681, 8679) THEN 'DISTRIBUTION'
+        WHEN c_date <= "2023-08-31" AND demo_id IN (91000, 92001, 92004, 92003) THEN 'OUTDOOR'
+        WHEN c_date <= "2023-08-31" AND demo_id IN(107122, 113930, 114089,3529) THEN 'WESTERN' --Member in the Eastern on 1/1 and terminated in Western
+        WHEN c_date <= "2022-10-31" AND demo_id IN(6918, 6923, 6916, 6901, 6951, 6934, 6906, 6915, 6950, 6920, 6900, 6910,6946, 6948, 6933, 6917, 6904, 6908, 6940, 113729, 6938, 6914, 6912, 6939, 114038 ) THEN 'FLORIDA'
+        WHEN c_date > "2022-10-01" AND demo_id IN(6918, 6923, 6916, 6901, 6951, 6934, 6906, 6915, 6950, 6920, 6900, 6910) THEN 'EASTERN'
+        WHEN c_date BETWEEN "2022-11-30" AND "2023-09-30" AND demo_id IN(113729,114038) THEN "demo Core" -- Stakeholder | 23-09-21
+        WHEN c_date <= "2023-10-31" AND demo_id = 113497 THEN 'EASTERN' -- 23-10-25 | Stakeholder
+        WHEN c_date <= "2023-10-31" AND demo_id = 105135 THEN 'WESTERN' -- 23-10-25 | Stakeholder
+        ELSE division_name_on_prev_date
+        END AS division_name_on_prev_date,
+      is_current_data,
+      "ns" AS data_source,
+      1 AS data_source_priority,
+      id,
+      linked_member, --  2023-09-11  | Stakeholder  | Added logic for FEI Linked members to not be included in bod
+      field_rep_on_date, -- 2025-06-26 | Stakeholder
+      field_rep_on_prev_date, -- 2025-06-26 | Stakeholder
+      -- regional_role_on_date, -- 2025-07-03 | Stakeholder -- 2026-05-22
+      -- regional_role_on_prev_date, -- 2025-07-03 | Stakeholder
+    FROM ns
+    WHERE demo_id NOT IN(93000)), -- 93000 is a duplicate and should not theoretically exist in demo_platform.
+  -- historical membership
+  mem_hist AS (
+    SELECT
+      c_date AS date,
+      demo_id,
+      NULL AS membership_subscription_id, -- 2026-05-05 | Stakeholder
+      is_brand_builder,
+      termination_date,
+      effective_date_membership,
+      mms_termination_reason AS termination_reason,
+      parent_id,
+      add_dealer,
+      delete_dealer,
+      dealer_is_active_on_date,
+      division_change,
+      parent_id_on_date,
+      parent_id_on_prev_date,
+      parent_id_change,
+      brand_builder_on_date,
+      brand_builder_on_prev_date,
+      brand_builder_change,
+      -- CASE division_name | 23-08-23 Business Rule: division name has been changed from East to Eastern and West to Western. Must be upper for power bi.
+      CASE
+        WHEN demo_id IN (1082, 1625, 1602, 6912, 1773, 1341, 1472, 1237, 1482, 1434) THEN "demo CORE"
+        WHEN UPPER(division_name) = 'EAST' THEN 'EASTERN'
+        WHEN UPPER(division_name) = 'WEST' THEN 'WESTERN'
+        -- WHEN UPPER(division_name) = 'DISTRIBUTION' THEN 'OTHER'
+        WHEN c_date <= "2023-08-31" AND demo_id IN (8665, 8667, 8674, 8675, 8676, 8677, 8678, 8689, 8680, 8681, 8679) THEN 'DISTRIBUTION'
+        WHEN c_date <= "2023-08-31" AND demo_id IN (91000, 92001, 92004, 92003) THEN 'OUTDOOR'
+        WHEN c_date <= "2023-08-31" AND demo_id IN(107122, 113930, 114089,3529) THEN 'WESTERN' --Member in the Eastern on 1/1 and terminated in Western
+        WHEN c_date <= "2022-10-01" AND demo_id IN(6918, 6923, 6916, 6901, 6951, 6934, 6906, 6915, 6950, 6920, 6900, 6910,6946, 6948, 6933, 6917, 6904, 6908, 6940, 113729, 6938, 6914, 6912, 6939, 114038 ) THEN 'FLORIDA' -- | Stakeholder | 2023-09-15
+        WHEN c_date > "2022-10-01" AND demo_id IN(6918, 6923, 6916, 6901, 6951, 6934, 6906, 6915, 6950, 6920, 6900, 6910) THEN 'EASTERN' -- | Stakeholder | 2023-09-15
+        ELSE division_name
+        END AS division_name,
+      CASE
+        WHEN demo_id IN (1082, 1625, 1602, 6912, 1773, 1341, 1472, 1237, 1482, 1434) THEN "demo CORE"
+        WHEN UPPER(division_name_on_date) = 'EAST' THEN 'EASTERN'
+        WHEN UPPER(division_name_on_date) = 'WEST' THEN 'WESTERN'
+        -- WHEN UPPER(division_name_on_date) = 'DISTRIBUTION' THEN 'OTHER'
+        WHEN c_date <= "2023-08-31" AND demo_id IN (8665, 8667, 8674, 8675, 8676, 8677, 8678, 8689, 8680, 8681, 8679) THEN 'DISTRIBUTION'
+        WHEN c_date <= "2023-08-31" AND demo_id IN (91000, 92001, 92004, 92003) THEN 'OUTDOOR'
+        WHEN c_date <= "2023-08-31" AND demo_id IN(107122, 113930, 114089,3529) THEN 'WESTERN' --Member in the Eastern on 1/1 and terminated in Western
+        WHEN c_date <= "2022-10-01" AND demo_id IN(6918, 6923, 6916, 6901, 6951, 6934, 6906, 6915, 6950, 6920, 6900, 6910,6946, 6948, 6933, 6917, 6904, 6908, 6940, 113729, 6938, 6914, 6912, 6939, 114038 ) THEN 'FLORIDA' -- | Stakeholder | 2023-09-15
+        WHEN c_date > "2022-10-01" AND demo_id IN(6918, 6923, 6916, 6901, 6951, 6934, 6906, 6915, 6950, 6920, 6900, 6910) THEN 'EASTERN' -- | Stakeholder | 2023-09-15
+        WHEN c_date <= "2022-01-31" AND demo_id IN(1625, 1508, 1501, 1282, 1072, 1530, 1513, 1399, 1547, 1482, 1754, 1498, 1524, 1552, 1551, 1677, 1596, 1841, 1743, 1913, 1636, 113497)
+          THEN 'EASTERN' -- Stakeholder | 23-10-24
+        WHEN c_date <= "2022-01-31" AND demo_id IN(1008, 1199, 1246, 1128, 1688, 1826, 1827, 1746, 1854, 1853, 1855, 1856, 1857, 1858, 1859, 1861)
+          THEN 'WESTERN' -- Stakeholder | 23-10-24
+        ELSE division_name_on_date
+        END AS division_name_on_date,
+      CASE
+        WHEN demo_id IN (1082, 1625, 1602, 6912, 1773, 1341, 1472, 1237, 1482, 1434) THEN "demo CORE"
+        WHEN UPPER(division_name_on_prev_date) = 'EAST' THEN 'EASTERN'
+        WHEN UPPER(division_name_on_prev_date) = 'WEST' THEN 'WESTERN'
+        -- WHEN UPPER(division_name_on_prev_date) = 'DISTRIBUTION' THEN 'OTHER'
+        WHEN c_date <= "2023-08-31" AND demo_id IN (8665, 8667, 8674, 8675, 8676, 8677, 8678, 8689, 8680, 8681, 8679) THEN 'DISTRIBUTION'
+        WHEN c_date <= "2023-08-31" AND demo_id IN (91000, 92001, 92004, 92003) THEN 'OUTDOOR'
+        WHEN c_date <= "2023-08-31" AND demo_id IN(107122, 113930, 114089,3529) THEN 'WESTERN' --Member in the Eastern on 1/1 and terminated in Western
+        WHEN c_date <= "2022-10-01" AND demo_id IN(6918, 6923, 6916, 6901, 6951, 6934, 6906, 6915, 6950, 6920, 6900, 6910,6946, 6948, 6933, 6917, 6904, 6908, 6940, 113729, 6938, 6914, 6912, 6939, 114038 ) THEN 'FLORIDA' -- | Stakeholder | 2023-09-15
+        WHEN c_date > "2022-10-01" AND demo_id IN(6918, 6923, 6916, 6901, 6951, 6934, 6906, 6915, 6950, 6920, 6900, 6910) THEN 'EASTERN' -- | Stakeholder | 2023-09-15
+        WHEN c_date <= "2022-01-31" AND demo_id IN(1625, 1508, 1501, 1282, 1072, 1530, 1513, 1399, 1547, 1482, 1754, 1498, 1524, 1552, 1551, 1677, 1596, 1841, 1743, 1913, 1636, 113497)
+          THEN 'EASTERN' -- Stakeholder | 23-10-24
+        WHEN c_date <= "2022-01-31" AND demo_id IN(1008, 1199, 1246, 1128, 1688, 1826, 1827, 1746, 1854, 1853, 1855, 1856, 1857, 1858, 1859, 1861)
+          THEN 'WESTERN' -- Stakeholder | 23-10-24
+        ELSE division_name_on_prev_date
+        END AS division_name_on_prev_date,
+      is_current_data,
+      "activenet" AS data_source,
+      2 AS data_source_priority,
+      id,
+      FALSE AS linked_member, --  2023-09-11  | Stakeholder  | Added logic for FEI Linked members to not be included in bod
+      SAFE_CAST(NULL as string) AS field_rep_on_date, -- 2025-06-26 | Stakeholder
+      SAFE_CAST(NULL as string) AS field_rep_on_prev_date, -- 2025-06-26 | Stakeholder
+      -- SAFE_CAST(NULL as string) AS regional_role_on_date, -- 2025-07-03 | Stakeholder
+      -- SAFE_CAST(NULL as string) AS regional_role_on_prev_date, -- 2025-07-03 | Stakeholder
+    FROM ${ref("demo_staging_netsuite", "membership_historical")}
+    where demo_id not in (114204,114263,114184,114285,93000,114146)),
+  mem_union AS (
+    SELECT * FROM mem
+    UNION ALL
+    SELECT * FROM mem_hist
+    ORDER BY date, demo_id, membership_subscription_id),
+  -- The below ROW_NUMBER() queries needed to be added to add a priority logic to the effected fields
+  --          (data_source_priority, brand_builder_change, division_change,termination_reason).
+  row_num_mem AS (
+    SELECT
+      *,
+      ROW_NUMBER() OVER (PARTITION BY demo_id,date ORDER BY data_source_priority) AS row_num
+    FROM mem_union ),
+  adds_deletes AS (
+    SELECT
+      row_num_mem.* EXCEPT(row_num),
+    FROM row_num_mem
+    WHERE row_num = 1),
+  -- division_name priority row_num logic
+  div_on_date_row_num AS (
+    SELECT
+      date,
+      demo_id,
+      division_name_on_date,
+      ROW_NUMBER() OVER (PARTITION BY date, demo_id ORDER BY data_source_priority) AS row_num
+    FROM mem_union
+    WHERE division_name_on_date IS NOT NULL),
+  div_on_date_row_num_2 AS (
+    SELECT
+      date,
+      demo_id,
+      division_name_on_date,
+    FROM div_on_date_row_num
+    WHERE row_num = 1),
+  div_on_prev_date_row_num AS (
+    SELECT
+      date,
+      demo_id,
+      division_name_on_prev_date,
+      ROW_NUMBER() OVER (PARTITION BY date, demo_id ORDER BY data_source_priority) AS row_num
+    FROM mem_union
+    WHERE division_name_on_prev_date IS NOT NULL),
+  div_on_prev_date_row_num_2 AS (
+    SELECT
+      date,
+      demo_id,
+      division_name_on_prev_date,
+    FROM div_on_prev_date_row_num
+    WHERE row_num = 1),
+  -- brand_builder priority row_num logic
+  bb_on_date_row_num AS (
+    SELECT
+      date,
+      demo_id,
+      brand_builder_on_date,
+      ROW_NUMBER() OVER (PARTITION BY date, demo_id ORDER BY data_source_priority) AS row_num
+    FROM mem_union
+    WHERE brand_builder_on_date IS NOT NULL),
+  bb_on_date_row_num_2 AS (
+    SELECT
+      date,
+      demo_id,
+      brand_builder_on_date,
+    FROM bb_on_date_row_num
+    WHERE row_num = 1),
+  bb_on_prev_date_row_num AS (
+    SELECT
+      date,
+      demo_id,
+      brand_builder_on_prev_date,
+      ROW_NUMBER() OVER (PARTITION BY date, demo_id ORDER BY data_source_priority) AS row_num
+    FROM mem_union
+    WHERE brand_builder_on_prev_date IS NOT NULL),
+  bb_on_prev_date_row_num_2 AS (
+    SELECT
+      date,
+      demo_id,
+      brand_builder_on_prev_date,
+    FROM bb_on_prev_date_row_num
+    WHERE row_num = 1),
+  -- parent_id_on_date priority row_num logic
+  parent_on_date_row_num AS (
+    SELECT
+      date,
+      demo_id,
+      parent_id,
+      parent_id_on_date,
+      ROW_NUMBER() OVER (PARTITION BY date, demo_id ORDER BY data_source_priority) AS row_num_change
+    FROM mem_union
+    WHERE parent_id_on_date IS NOT NULL),
+  parent_on_date_row_num_2 AS (
+    SELECT
+      date,
+      demo_id,
+      parent_id,
+      parent_id_on_date,
+    FROM parent_on_date_row_num
+    WHERE row_num_change = 1),
+  parent_on_prev_date_row_num AS (
+    SELECT
+      date,
+      demo_id,
+      parent_id_on_prev_date,
+      ROW_NUMBER() OVER (PARTITION BY date, demo_id ORDER BY data_source_priority) AS row_num_change
+    FROM mem_union
+    WHERE parent_id_on_prev_date IS NOT NULL),
+  parent_on_prev_date_row_num_2 AS (
+    SELECT
+      date,
+      demo_id,
+      parent_id_on_prev_date,
+    FROM parent_on_prev_date_row_num
+    WHERE row_num_change = 1),
+  -- termination_reason priority row_num logic
+  term_reasons AS (
+    SELECT
+      date,
+      demo_id,
+      termination_reason,
+      ROW_NUMBER() OVER (PARTITION BY date, demo_id ORDER BY data_source_priority) AS row_num_term_reason
+    FROM mem_union
+    WHERE termination_reason IS NOT NULL),
+  term_reasons_2 AS (
+    SELECT
+      * EXCEPT(row_num_term_reason)
+    FROM term_reasons
+    WHERE row_num_term_reason = 1),
+  -- Logic for field_rep
+  -- 2025-06-26 | Stakeholder
+  field_rep_on_date AS(
+    SELECT
+      date,
+      demo_id,
+      field_rep_on_date,
+    FROM mem_union
+    WHERE field_rep_on_date IS NOT NULL
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY date, demo_id ORDER BY data_source_priority) = 1
+    ),
+  field_rep_on_prev_date AS(
+    SELECT
+      date,
+      demo_id,
+      field_rep_on_prev_date,
+    FROM mem_union
+    WHERE field_rep_on_prev_date IS NOT NULL
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY date, demo_id ORDER BY data_source_priority) = 1
+    ),
+  -- Logic for regional_role
+  -- 2025-07-03 | Stakeholder
+  -- regional_role_on_date AS(
+  --   SELECT
+  --     date,
+  --     demo_id,
+  --     regional_role_on_date,
+  --   FROM mem_union
+  --   WHERE regional_role_on_date IS NOT NULL
+  --   QUALIFY ROW_NUMBER() OVER (PARTITION BY date, demo_id ORDER BY data_source_priority) = 1
+  --   ),
+  -- regional_role_on_prev_date AS(
+  --   SELECT
+  --     date,
+  --     demo_id,
+  --     regional_role_on_prev_date,
+  --   FROM mem_union
+  --   WHERE regional_role_on_prev_date IS NOT NULL
+  --   QUALIFY ROW_NUMBER() OVER (PARTITION BY date, demo_id ORDER BY data_source_priority) = 1
+  --   ),
+  -- Logic for acquisition_date
+  acq_date AS (
+    SELECT
+      adds_deletes.date,
+      adds_deletes.demo_id,
+      CASE
+        WHEN LOWER(division_name) = 'azione' THEN '2021-09-30'
+        WHEN LOWER(division_name) = 'fei' THEN '2022-05-31'
+        WHEN LOWER(dwm.source_type) = 'mega' THEN '2017-10-20'
+        ELSE NULL
+        END AS acquisition_date,
+    FROM adds_deletes
+    LEFT JOIN (SELECT
+                DISTINCT demo_id,
+                source_type
+              FROM ${ref("demo_sources", "members")}
+              WHERE LOWER(source_type) = 'mega') dwm
+      ON adds_deletes.demo_id = dwm.demo_id),
+  -- Logic for board of director fields. This gets transformed again outside of the CTE (IF parent_id_on_date IS NOT NULL THEN 0)
+  bod_fields AS (
+    SELECT
+      adds_deletes.date,
+      adds_deletes.demo_id,
+      IF(IFNULL(adds_deletes.effective_date_membership,"2099-01-01") >= IFNULL(DATE(acquisition_date),DATE("1970-01-01")), adds_deletes.add_dealer, 0) AS bod_add_dealer,
+      IF(IFNULL(adds_deletes.termination_date,"2099-01-01") >= IFNULL(DATE(acquisition_date),DATE("1970-01-01")), adds_deletes.delete_dealer, 0) AS bod_delete_dealer,
+      IF(adds_deletes.date >= LAST_DAY(IFNULL(DATE(acquisition_date),DATE("1970-01-01")),month), adds_deletes.dealer_is_active_on_date, 0) AS bod_dealer_is_active_on_date
+    FROM adds_deletes
+    LEFT JOIN acq_date
+      USING(date,demo_id))
+
+SELECT
+  adds_deletes.* EXCEPT (
+    brand_builder_change,
+    brand_builder_on_date,
+    brand_builder_on_prev_date,
+    division_change,
+    division_name_on_date,
+    division_name_on_prev_date,
+    termination_reason,
+    parent_id,
+    parent_id_on_date,
+    parent_id_on_prev_date,
+    field_rep_on_date, -- 2025-06-26 | Stakeholder
+    field_rep_on_prev_date -- 2025-06-26 | Stakeholder
+    -- , regional_role_on_date -- 2025-07-03 | Stakeholder
+    -- , regional_role_on_prev_date -- 2025-07-03 | Stakeholder
+    ),
+  bb_on_date_row_num_2.brand_builder_on_date,
+  bb_on_prev_date_row_num_2.brand_builder_on_prev_date,
+  div_on_date_row_num_2.division_name_on_date,
+  div_on_prev_date_row_num_2.division_name_on_prev_date,
+  term_reasons_2.termination_reason,
+  parent_on_date_row_num_2.parent_id,
+  IF(parent_on_date_row_num_2.parent_id_on_date = 0, NULL, parent_on_date_row_num_2.parent_id_on_date) AS parent_id_on_date,  -- Assigns NULL to 0 values. Used below for bod_dealer_is_active_on_date.
+  parent_on_prev_date_row_num_2.parent_id_on_prev_date,
+  dm._group AS division_group,
+  acq_date.acquisition_date,
+  IF(parent_on_date_row_num_2.parent_id_on_date IS NOT NULL, 0, bod_add_dealer) AS bod_add_dealer,
+  IF(parent_on_date_row_num_2.parent_id_on_date IS NOT NULL, 0, bod_delete_dealer) AS bod_delete_dealer,
+  IF(IF(parent_on_date_row_num_2.parent_id_on_date = 0, NULL, parent_on_date_row_num_2.parent_id_on_date) IS NOT NULL, 0, bod_dealer_is_active_on_date) AS bod_dealer_is_active_on_date,
+  field_rep_on_date.field_rep_on_date, -- 2025-06-26 | Stakeholder
+  field_rep_on_prev_date.field_rep_on_prev_date, -- 2025-06-26 | Stakeholder
+  -- regional_role_on_date.regional_role_on_date, -- 2025-07-03 | Stakeholder
+  -- regional_role_on_prev_date.regional_role_on_prev_date, -- 2025-07-03 | Stakeholder
+FROM adds_deletes
+LEFT JOIN bb_on_date_row_num_2
+  USING (date,demo_id)
+LEFT JOIN bb_on_prev_date_row_num_2
+  USING (date,demo_id)
+LEFT JOIN div_on_date_row_num_2
+  USING (date,demo_id)
+LEFT JOIN div_on_prev_date_row_num_2
+  USING (date,demo_id)
+LEFT JOIN parent_on_date_row_num_2
+  USING (date,demo_id)
+LEFT JOIN parent_on_prev_date_row_num_2
+  USING (date,demo_id)
+LEFT JOIN term_reasons_2
+  USING (date,demo_id)
+LEFT JOIN acq_date
+  USING (date,demo_id)
+LEFT JOIN bod_fields
+  USING(date,demo_id)
+LEFT JOIN field_rep_on_date -- 2025-06-26 | Stakeholder
+  USING (date,demo_id)
+LEFT JOIN field_rep_on_prev_date -- 2025-06-26 | Stakeholder
+  USING (date,demo_id)
+-- LEFT JOIN regional_role_on_date -- 2025-07-03 | Stakeholder
+--   USING (date,demo_id)
+-- LEFT JOIN regional_role_on_prev_date -- 2025-07-03 | Stakeholder
+--   USING (date,demo_id)
+LEFT JOIN (SELECT
+              DISTINCT division_name,
+              _group
+            FROM ${ref("demo_staging_netsuite", "division_mapping")}) dm
+  ON adds_deletes.division_name = dm.division_name
+);
+
+CREATE OR REPLACE TABLE ${self()}
+  OPTIONS(description = "Purpose: Track additions, deletions, and movement of members for operational and board of directors membership reporting.")
+  AS (
+WITH
+  mem AS (
+    SELECT
+      * EXCEPT(division_name,
+        division_name_on_date,
+        division_name_on_prev_date,
+        is_brand_builder,
+        brand_builder_on_date,
+        brand_builder_on_prev_date),
+      CASE
+        WHEN UPPER(division_name)="NECO - ADC" THEN "NECO"
+        WHEN UPPER(division_name)="AZIONE CANADA" THEN "AZIONE"
+        WHEN UPPER(division_name)="NORTHEAST" THEN "EASTERN"
+        ELSE UPPER(division_name)
+        END AS division_name,
+      CASE
+        WHEN UPPER(division_name) = "CANTREX" THEN "CANTREX" -- 2024-02-15 | Stakeholder
+        WHEN UPPER(division_name) = "SOUTHWEST" THEN "SOUTHWEST" -- 2024-02-15 | Stakeholder
+        WHEN UPPER(division_name_on_date)="NECO - ADC" THEN "NECO"
+        WHEN UPPER(division_name_on_date)="AZIONE CANADA" THEN "AZIONE"
+        WHEN UPPER(division_name_on_date)="NORTHEAST" THEN "EASTERN"
+        WHEN demo_id = 60044 AND date <= "2024-04-30" THEN "UNITED STORES" -- 2024-09-06 | Stakeholder
+        WHEN demo_id = 170979 AND date <= "2023-12-31" THEN "EASTERN" -- 2024-09-06 | Stakeholder
+        WHEN demo_id=50494 AND date="2019-11-30" THEN "SOUTHWEST" --adding these 2 southwest dealers 8/9/2023 Stakeholder uz
+        WHEN demo_id=50369 AND date="2021-06-30" THEN "SOUTHWEST" --adding these 2 southwest dealers 8/9/2023 Stakeholder uz
+        WHEN date <= "2023-10-31" AND demo_id = 2274 THEN 'WESTERN' -- Stakeholder 23-10-24
+        WHEN date < '2024-10-01' and demo_id in (176235, 176245, 176296, 176311,176247, 176293,176294,176295) THEN 'FEI' -- 2024-10-07 | Stakeholder
+        WHEN date <= '2025-01-31' and demo_id = 51218 THEN 'AZIONE' -- 2025-01-29 | Stakeholder
+        ELSE UPPER(division_name_on_date)
+        END AS division_name_on_date,
+      CASE
+        WHEN UPPER(division_name) = "CANTREX" THEN "CANTREX" -- 2024-02-15 | Stakeholder
+        WHEN UPPER(division_name) = "SOUTHWEST" THEN "SOUTHWEST" -- 2024-02-15 | Stakeholder
+        WHEN UPPER(division_name_on_prev_date)="NECO - ADC" THEN "NECO"
+        WHEN UPPER(division_name_on_prev_date)="AZIONE CANADA" THEN "AZIONE"
+        WHEN UPPER(division_name_on_prev_date)="NORTHEAST" THEN "EASTERN"
+        -- WHEN UPPER(division_name_on_prev_date)="OUTDOOR" THEN "OTHER"
+        WHEN demo_id = 60044 AND date <= "2024-04-30" THEN "UNITED STORES" -- 2024-09-06 | Stakeholder
+        WHEN demo_id = 170979 AND date <= "2023-12-31" THEN "EASTERN" -- 2024-09-06 | Stakeholder
+        WHEN demo_id=50494 AND date="2019-11-30" THEN "SOUTHWEST" --adding these 2 southwest dealers 8/9/2023 Stakeholder uz
+        WHEN demo_id=50369 AND date="2021-06-30" THEN "SOUTHWEST" --adding these 2 southwest dealers 8/9/2023 Stakeholder uz
+        WHEN date <= "2023-10-31" AND demo_id = 2274 THEN 'WESTERN' -- Stakeholder 23-10-24
+        WHEN demo_id IN(6918, 6923, 6916, 6901, 6951, 6934, 6906, 6915, 6950, 6920, 6900, 6910) AND date ="2022-10-31" THEN "FLORIDA" -- | Stakeholder | 2023-09-15
+        WHEN date < '2024-10-01' and demo_id in (176235, 176245, 176296, 176311,176247, 176293,176294,176295) THEN 'FEI' -- 2024-10-07 | Stakeholder
+        -- WHEN date <= '2023-12-31' and demo_id = 51218 THEN 'SOUTHWEST' -- 2025-01-27 | Stakeholder
+        WHEN date <= '2025-01-31' and demo_id = 51218 THEN 'AZIONE' -- 2025-01-29 | Stakeholder
+        ELSE UPPER(division_name_on_prev_date)
+        END AS division_name_on_prev_date,
+      --special CASE FOR 1748 TO make them non-brandbuilder historically 8/9/2023 Stakeholder uz
+      CASE
+        WHEN demo_id=1748 THEN FALSE
+        ELSE is_brand_builder
+        END AS is_brand_builder,
+      CASE
+        WHEN demo_id=1748 THEN FALSE
+        ELSE brand_builder_on_date
+        END AS brand_builder_on_date,
+      CASE
+        WHEN demo_id=1748 THEN FALSE
+        ELSE brand_builder_on_prev_date
+        END AS brand_builder_on_prev_date
+      --END special CASE FOR 1748 TO make them non-brandbuilder historically 8/9/2023 Stakeholder uz
+    FROM mrtemp ),
+  min_dates_divs AS (
+    SELECT
+      mem.demo_id,
+      mins.min_date,
+      mem.division_name_on_date AS division_name_on_date_filler,
+      mem.division_name_on_date AS division_name_on_prev_date_filler
+    FROM mem
+    INNER JOIN (
+      SELECT
+        demo_id,
+        MIN(date) AS min_date
+      FROM mem
+      WHERE division_name_on_date IS NOT NULL
+      GROUP BY demo_id ) mins
+    ON mins.demo_id=mem.demo_id
+      AND mins.min_date=mem.date ),
+  min_dates_bb AS (
+    SELECT
+      mem.demo_id,
+      mins.min_date,
+      mem.brand_builder_on_date AS brand_builder_on_date_filler,
+      mem.brand_builder_on_date AS brand_builder_on_prev_date_filler
+    FROM   mem
+    INNER JOIN (
+      SELECT
+        demo_id,
+        MIN(date) AS min_date
+      FROM mem
+      WHERE brand_builder_on_date IS NOT NULL
+      GROUP BY demo_id ) mins
+    ON mins.demo_id=mem.demo_id
+      AND mins.min_date=mem.date ),
+  min_dates_parents AS (
+    SELECT
+      mem.demo_id,
+      mins.min_date,
+      mem.parent_id_on_date AS parent_id_on_date_filler,
+      mem.parent_id_on_date AS parent_id_on_prev_date_filler
+    FROM mem
+    INNER JOIN (
+      SELECT
+        demo_id,
+        MIN(date) AS min_date
+      FROM mem
+      WHERE parent_id_on_date IS NOT NULL
+      GROUP BY demo_id ) mins
+    ON mins.demo_id=mem.demo_id
+      AND mins.min_date=mem.date ),
+  min_dates_field_rep AS ( -- 2025-06-26 | Stakeholder
+    SELECT
+      mem.demo_id,
+      mins.min_date,
+      mem.field_rep_on_date AS field_rep_on_date_filler,
+      mem.field_rep_on_prev_date AS field_rep_on_prev_date_filler
+    FROM mem
+    INNER JOIN (
+      SELECT
+        demo_id,
+        MIN(date) AS min_date
+      FROM mem
+      WHERE field_rep_on_date IS NOT NULL OR field_rep_on_prev_date IS NOT NULL
+      GROUP BY demo_id ) mins
+    ON mins.demo_id=mem.demo_id
+      AND mins.min_date=mem.date ),
+  -- min_dates_regional_role AS ( -- 2025-07-03 | Stakeholder
+  --   SELECT
+  --     mem.demo_id,
+  --     mins.min_date,
+  --     mem.regional_role_on_date AS regional_role_on_date_filler,
+  --     mem.regional_role_on_prev_date AS regional_role_on_prev_date_filler
+  --   FROM mem
+  --   INNER JOIN (
+  --     SELECT
+  --       demo_id,
+  --       MIN(date) AS min_date
+  --     FROM mem
+  --     WHERE regional_role_on_date IS NOT NULL OR regional_role_on_prev_date IS NOT NULL
+  --     GROUP BY demo_id ) mins
+  --   ON mins.demo_id=mem.demo_id
+  --     AND mins.min_date=mem.date ),
+  clean AS (
+    SELECT
+      mem.*,
+      min_dates_divs.* EXCEPT(demo_id, min_date),
+      min_dates_bb.* EXCEPT(demo_id, min_date),
+      min_dates_parents.* EXCEPT(demo_id, min_date),
+      min_dates_field_rep.* EXCEPT(demo_id, min_date), -- 2025-06-26 | Stakeholder
+      -- min_dates_regional_role.* EXCEPT(demo_id, min_date), -- 2025-07-03 | Stakeholder
+    FROM mem
+    LEFT JOIN min_dates_divs
+    ON mem.date<=min_dates_divs.min_date
+      AND mem.demo_id=min_dates_divs.demo_id
+    LEFT JOIN min_dates_bb
+    ON mem.date<=min_dates_bb.min_date
+      AND mem.demo_id=min_dates_bb.demo_id
+    LEFT JOIN min_dates_parents
+    ON mem.date<=min_dates_parents.min_date
+      AND mem.demo_id=min_dates_parents.demo_id
+    LEFT JOIN min_dates_field_rep -- 2025-06-26 | Stakeholder
+    ON mem.date<=min_dates_field_rep.min_date
+      AND mem.demo_id=min_dates_field_rep.demo_id
+    -- LEFT JOIN min_dates_regional_role -- 2025-07-03 | Stakeholder
+    -- ON mem.date<=min_dates_regional_role.min_date
+    --   AND mem.demo_id=min_dates_regional_role.demo_id
+  ),
+  cleaner AS (
+    SELECT
+      clean.date,
+      clean.demo_id,
+      clean.membership_subscription_id, -- 2026-05-05 | Stakeholder
+      clean.division_name,
+      clean.is_brand_builder,
+      clean.termination_date,
+      clean.effective_date_membership,
+      clean.termination_reason,
+      clean.parent_id,
+      clean.add_dealer,
+      clean.delete_dealer,
+      clean.dealer_is_active_on_date,
+      IFNULL(parent_id_on_date,parent_id_on_date_filler) AS parent_id_on_date,
+      IFNULL(parent_id_on_prev_date,parent_id_on_prev_date_filler) AS parent_id_on_prev_date,
+      IFNULL(brand_builder_on_date,brand_builder_on_date_filler) AS brand_builder_on_date,
+      IFNULL(brand_builder_on_prev_date,brand_builder_on_prev_date_filler) AS brand_builder_on_prev_date,
+      IFNULL(division_name_on_date,division_name_on_date_filler) AS division_name_on_date,
+      IFNULL(division_name_on_prev_date,division_name_on_prev_date_filler) AS division_name_on_prev_date,
+      IFNULL(field_rep_on_date, field_rep_on_date_filler) AS field_rep_on_date, -- 2025-06-26 | Stakeholder
+      IFNULL(field_rep_on_prev_date, field_rep_on_prev_date_filler) AS field_rep_on_prev_date, -- 2025-06-26 | Stakeholder
+      -- IFNULL(regional_role_on_date, regional_role_on_date_filler) AS regional_role_on_date, -- 2025-07-03 | Stakeholder
+      -- IFNULL(regional_role_on_prev_date, regional_role_on_prev_date_filler) AS regional_role_on_prev_date, -- 2025-07-03 | Stakeholder
+      clean.is_current_data,
+      clean.data_source,
+      clean.id,
+      source_type,
+      CASE
+        WHEN LOWER(clean.division_name) = 'azione' THEN '2021-09-30'
+        WHEN LOWER(clean.division_name) = 'fei' THEN '2022-05-31'
+        WHEN LOWER(m.source_type) = 'mega' THEN '2017-10-20'
+        ELSE NULL
+        END AS acquisition_date,
+      clean.linked_member, --  2023-09-11  | Stakeholder  | Added logic for FEI Linked members to not be included in bod
+    FROM clean
+    LEFT JOIN (
+      SELECT
+        DISTINCT demo_id,
+        "mega" AS source_type
+      FROM `demo-project.demo_sources.members`
+      WHERE LOWER(source_type) = 'mega' ) m
+    USING(demo_id) ),
+  dm AS (
+    SELECT
+      DISTINCT division_name,
+      _group
+    FROM `demo-project.demo_staging_netsuite.division_mapping`
+    WHERE division_name IS NOT NULL ),
+  groups_now AS (
+    SELECT
+      cleaner.* EXCEPT(is_brand_builder,
+        brand_builder_on_date,
+        brand_builder_on_prev_date,
+        linked_member), --  2023-09-11  | Stakeholder  | Added logic for FEI Linked members to not be included in bod
+      IF(cleaner.parent_id IS NOT NULL, FALSE,cleaner.is_brand_builder) AS is_brand_builder,
+      IF(cleaner.parent_id_on_date IS NOT NULL, FALSE,cleaner.brand_builder_on_date) AS brand_builder_on_date,
+      IF(cleaner.parent_id_on_prev_date IS NOT NULL, FALSE, cleaner.brand_builder_on_prev_date) AS brand_builder_on_prev_date,
+      CASE
+        WHEN acquisition_date IS NOT NULL AND LAST_DAY(DATE(acquisition_date),month)=LAST_DAY(DATE(date),month) AND dealer_is_active_on_date=1 THEN 1
+        WHEN linked_member IS TRUE AND dm.division_name = 'FEI' THEN 0 --  2023-09-11  | Stakeholder  | Added logic for FEI Linked members to not be included in bod
+        WHEN IFNULL(effective_date_membership,"2099-01-01") >= IFNULL(DATE(acquisition_date),DATE("1970-01-01")) THEN add_dealer
+        ELSE 0
+        END AS bod_add_dealer,
+      CASE
+        WHEN linked_member IS TRUE AND dm.division_name = 'FEI' THEN 0 --  2023-09-11  | Stakeholder  | Added logic for FEI Linked members to not be included in bod
+        ELSE IF(IFNULL(termination_date,"2099-01-01") >= IFNULL(DATE(acquisition_date),DATE("1970-01-01")), delete_dealer, 0)
+        END AS bod_delete_dealer,
+      CASE
+        WHEN linked_member IS TRUE AND dm.division_name = 'FEI' THEN 0 --  2023-09-11  | Stakeholder  | Added logic for FEI Linked members to not be included in bod
+        ELSE IF(date >= LAST_DAY(IFNULL(DATE(acquisition_date),DATE("1970-01-01")),month), dealer_is_active_on_date, 0)
+        END AS bod_dealer_is_active_on_date,
+      CASE
+        WHEN demo_id IN (6912) AND date <= "2022-10-01" THEN "Affiliate" -- | Stakeholder | 2023-09-15
+        WHEN demo_id IN (1082, 1625, 1602, 6912, 1773, 1341, 1472, 1237, 1482, 1434) THEN "Associate"
+        ELSE dm._group
+        END AS division_group,
+    FROM cleaner
+    LEFT JOIN dm
+    ON UPPER(cleaner.division_name) = UPPER(dm.division_name) ),
+  groups_on_date AS (
+    SELECT
+      groups_now.*,
+      CASE
+        WHEN demo_id IN (1082, 1625, 1602, 6912, 1773, 1341, 1472, 1237, 1482, 1434) THEN "Associate"
+        WHEN demo_id IN (6912) AND date <= "2022-10-01" THEN "Affiliate" -- | Stakeholder | 2023-09-15
+        WHEN date <= "2023-10-31" AND demo_id = 113497 THEN 'Associate' -- 23-10-25 | Stakeholder
+        WHEN date <= "2024-10-31" AND demo_id IN (176247, 176293,176294,176295) THEN 'FEI' -- 2025-01-03 | Stakeholder
+        ELSE dm._group
+        END AS division_group_on_date
+    FROM groups_now
+    LEFT JOIN dm
+    ON UPPER(dm.division_name)=UPPER(groups_now.division_name_on_date) ),
+  progress AS (
+    SELECT
+      groups_on_date.*,
+      CASE
+        WHEN demo_id IN (1082, 1625, 1602, 6912, 1773, 1341, 1472, 1237, 1482, 1434) THEN "Associate"
+        WHEN demo_id IN (6912) AND date <= "2022-10-31" THEN "Affiliate" -- | Stakeholder | 2023-09-15
+        WHEN date <= "2023-10-31" AND demo_id = 113497 THEN 'Associate' -- 23-10-25 | Stakeholder
+        WHEN date <= "2024-10-31" AND demo_id IN (176247, 176293,176294,176295) THEN 'FEI' -- 2025-01-03 | Stakeholder
+        ELSE dm._group
+        END AS division_group_on_prev_date
+    FROM groups_on_date
+    LEFT JOIN dm
+    ON UPPER(dm.division_name)=UPPER(groups_on_date.division_name_on_prev_date)),
+  prefin AS(
+    SELECT
+      *,
+      CASE
+        WHEN IFNULL(brand_builder_on_date,FALSE)!=IFNULL(brand_builder_on_prev_date,FALSE) THEN TRUE
+        ELSE FALSE
+        END AS brand_builder_change,
+      CASE
+        WHEN IFNULL(parent_id_on_date,0)!=IFNULL(parent_id_on_prev_date,0) THEN TRUE
+        ELSE FALSE
+        END AS parent_id_change
+    FROM progress
+    WHERE demo_id NOT IN (333333,999999,201644,114153) ),
+  conn_serv AS (
+    SELECT
+      DISTINCT demo_id,
+      TRUE AS connected_services
+    FROM prefin
+    WHERE division_name_on_date="CONNECTED SERVICES"
+      AND date<="2023-07-31"), --might need TO UPDATE the date LIMIT IF more get moved FROM core
+  natm AS (
+    SELECT
+      DISTINCT demo_id AS natm_demo_id,
+      division_name_on_date AS natm_division_name_on_date,
+      division_group_on_date AS natm_division_group_on_date
+    FROM prefin
+    WHERE division_name_on_prev_date="NATM"
+      AND date="2023-07-31"
+      AND division_name_on_date!=division_name_on_prev_date), --might need TO UPDATE the date LIMIT
+  almost_there AS (
+    SELECT
+      * EXCEPT(division_name,
+        division_name_on_date,
+        division_name_on_prev_date,
+        division_group,
+        division_group_on_date,
+        division_group_on_prev_date,
+        natm_demo_id,
+        natm_division_name_on_date,
+        natm_division_group_on_date),
+      CASE
+        WHEN connected_services=TRUE THEN "CONNECTED SERVICES"
+        WHEN natm_division_name_on_date IS NOT NULL THEN natm_division_name_on_date
+        WHEN demo_id=1748 THEN "OTHER"
+        ELSE division_name
+        END AS division_name,
+      CASE
+        WHEN division_name = 'OASYS' THEN 'OASYS' -- Stakeholder 23-10-24
+        WHEN connected_services=TRUE THEN "CONNECTED SERVICES"
+        WHEN natm_division_name_on_date IS NOT NULL THEN natm_division_name_on_date
+        WHEN demo_id=1748 THEN "OTHER"
+        ELSE division_name_on_date
+        END AS division_name_on_date,
+      CASE
+        WHEN division_name = 'OASYS' THEN 'OASYS' -- Stakeholder 23-10-24
+        WHEN connected_services=TRUE THEN "CONNECTED SERVICES"
+        WHEN natm_division_name_on_date IS NOT NULL THEN natm_division_name_on_date
+        WHEN demo_id=1748 THEN "OTHER"
+        WHEN division_name_on_prev_date IS NULL AND DATE_TRUNC(effective_date_membership,month)=DATE_TRUNC(date,month) THEN division_name_on_date --8/8/23 Stakeholder uz addition
+        --consider just filling NULLS IN WITH division_name_on_date
+        ELSE division_name_on_prev_date
+        END AS division_name_on_prev_date,
+      CASE
+        WHEN connected_services=TRUE THEN "Associate"
+        WHEN natm_division_group_on_date IS NOT NULL THEN natm_division_group_on_date
+        WHEN demo_id=1748 THEN "Other"
+        WHEN division_name IN ("OTHER","OUTDOOR") THEN "Other"
+        ELSE division_group
+        END AS division_group,
+      CASE
+        WHEN division_name = 'OASYS' THEN 'CI' -- Stakeholder 23-10-24
+        WHEN connected_services=TRUE THEN "Associate"
+        WHEN natm_division_group_on_date IS NOT NULL THEN natm_division_group_on_date
+        WHEN demo_id=1748 THEN "Other"
+        WHEN division_name_on_date IN ("OTHER","OUTDOOR") THEN "Other"
+        ELSE division_group_on_date
+        END AS division_group_on_date,
+      CASE
+        WHEN division_name = 'OASYS' THEN 'CI' -- Stakeholder 23-10-24
+        WHEN connected_services=TRUE THEN "Associate"
+        WHEN natm_division_group_on_date IS NOT NULL THEN natm_division_group_on_date
+        WHEN demo_id=1748 THEN "Other"
+        WHEN division_name_on_prev_date IN ("OTHER", "OUTDOOR") THEN "Other"
+        WHEN division_group_on_prev_date IS NULL AND DATE_TRUNC(effective_date_membership,month)=DATE_TRUNC(date,month) THEN division_group_on_date --8/8/23 Stakeholder uz addition --consider just filling NULLS IN WITH division_group_on_date
+        ELSE division_group_on_prev_date
+        END AS division_group_on_prev_date,
+      CASE
+        WHEN division_name_on_date="OUTDOOR" AND division_name_on_prev_date="OTHER" THEN "x"
+        WHEN division_name_on_date="OTHER" AND division_name_on_prev_date="OUTDOOR" THEN "x"
+        END AS other_divs
+    FROM prefin
+    LEFT JOIN conn_serv
+    USING (demo_id)
+    LEFT JOIN natm
+    ON natm.natm_demo_id=prefin.demo_id
+      AND prefin.date<="2023-07-31" ),
+  one_more AS (
+    SELECT
+      * EXCEPT(other_divs,
+        connected_services),
+      IF(division_name IS NULL,TRUE,FALSE) AS division_name_missing,
+      IF(division_name_on_date IS NULL,TRUE,FALSE) AS division_name_on_date_missing,
+      IF(division_name_on_prev_date IS NULL,TRUE,FALSE) AS division_name_on_prev_date_missing,
+      CASE
+        WHEN UPPER(IFNULL(division_name_on_date,""))!=UPPER(IFNULL(division_name_on_prev_date,"")) AND other_divs IS NULL THEN TRUE
+      ELSE FALSE
+      END AS division_change,
+      CASE
+        WHEN UPPER(IFNULL(division_group_on_date,""))!=UPPER(IFNULL(division_group_on_prev_date,"")) AND other_divs IS NULL THEN TRUE
+        ELSE FALSE
+        END AS division_group_change,
+    FROM almost_there ),
+  group_bod_fix AS (
+    SELECT
+      one_more.* EXCEPT(brand_builder_change),
+      SAFE_CAST(demo_id AS STRING) AS demo_id_str,
+      IFNULL(brand_builder_on_date, FALSE)
+        != IFNULL(brand_builder_on_prev_date, FALSE)
+        AS brand_builder_change,
+      IFNULL(
+        IF(
+          is_brand_builder = TRUE,
+          "Brand Builder",
+          division_group
+        ),
+        "Other"
+      ) AS group_bod,
+      IFNULL(
+        IF(
+          brand_builder_on_date = TRUE,
+          "Brand Builder",
+          division_group_on_date
+        ),
+        "Other"
+      ) AS group_bod_on_date,
+      IFNULL(
+        IF(
+          brand_builder_on_prev_date = TRUE,
+          "Brand Builder",
+          division_group_on_prev_date
+        ),
+        "Other"
+      ) AS group_bod_on_prev_date,
+      CASE
+        WHEN effective_date_membership IS NULL
+          OR effective_date_membership > IFNULL(
+            termination_date,
+            DATE_ADD(CURRENT_DATE(), INTERVAL 1 DAY)
+          )
+          THEN TRUE
+        ELSE FALSE
+        END AS issues_exist
+    FROM one_more
+    INNER JOIN (
+      SELECT DISTINCT
+        demo_id
+      FROM ${ref("demo_staging_netsuite", "membership_reporting_driver")}
+      )
+      USING (demo_id)
+  ),
+  field_by_quarter as (
+    -- 2025-07-01 | field_rep_by_quarter is calculated to show the most recent field rep for each quarter.
+    --              This is done by partitioning the data by demo_id and quarter, and then ordering by date to get the latest field rep for that period.
+    SELECT
+      *,
+      FIRST_VALUE(field_rep_on_date) OVER (
+        PARTITION BY
+          demo_id,
+          CONCAT(
+            EXTRACT(year FROM date),
+            "-",
+            EXTRACT(quarter FROM date)
+          )
+        ORDER BY
+          date DESC
+      ) AS field_rep_by_quarter
+      -- , FIRST_VALUE(regional_role_on_date) OVER (
+      --     PARTITION BY
+      --       demo_id,
+      --       CONCAT(
+      --         EXTRACT(year FROM date),
+      --         "-",
+      --         EXTRACT(quarter FROM date)
+      --       )
+      --     ORDER BY
+      --       date DESC
+      --   ) AS regional_role_by_quarter -- 2025-07-03 | Stakeholder
+      FROM group_bod_fix
+  )
+
+SELECT
+  *
+FROM field_by_quarter);
+
+-- Clean up
+DROP TABLE mrtemp;

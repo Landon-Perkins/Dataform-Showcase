@@ -1,0 +1,31 @@
+config {
+  type: "incremental",
+  name: "product_competitor_pricing_snapshots",
+  schema: "demo_sources_products",
+  partitionBy: "DATE(captured_at)",
+  bigquery: {
+    labels: {
+      scheduler: "dataform",
+      frequency: "daily",
+    }
+  },
+  tags: ["snapshots daily"],
+  description: "Historical competitor pricing snapshots, incrementally appended by day.",
+  protected: true
+}
+
+
+SELECT
+  id,
+  created_at,
+  updated_at,
+  captured_at,
+  price,
+  brand_code,
+  part_number,
+  competitor_id
+FROM `demo-project.product_data_production.public_competitor_pricing`
+${when(incremental(),
+    `WHERE captured_at > (SELECT MAX(captured_at) FROM ${self()})`
+    )
+  }

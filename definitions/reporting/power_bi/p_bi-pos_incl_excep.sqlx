@@ -1,0 +1,1097 @@
+config { type: "table",
+        name: "pos_incl_excep",
+        schema: "demo_reporting",
+        description: "Power BI-ready POS analytics dataset including enriched product attributes and exception logic for sales-quality review.",
+        tags: ["reporting","pos","2 hour"],
+        bigquery: {
+          clusterBy: ["parent_brand_code"],
+          partitionBy: "t_date",
+          labels: {
+            scheduler: "dataform",
+            frequency: "2_hour"
+          }
+        },
+        dependencies: [
+           "pos_qa_vol_unit_changes_log",
+        ],
+        dependOnDependencyAssertions: true,
+        columns: {
+          demo_id_str: "Field demo_id converted to STRING for Power BI use.",
+          exception: "Exception flag logic incorporating z_scrore, zero price, zero units, missing demo_id, and missing date.",
+          exception_excluded: "Original exception logic from demo_staging using mvw_pos_exceptions xref."
+          },
+        assertions: {
+          uniqueKeys: [["id","retail_location_id"]]
+        }
+        }
+
+---------------------------------------
+-- Dataflow and transformation logic.
+---------------------------------------
+-- product_key:
+--   The original POS product assignment coming from the source table.
+-- product_key_v4:
+--   The alternate product match produced by the new V4 matching algorithm.
+--   This transformation preserves both sets of fields through the pipeline so the final
+--   selection can be made at the end.
+--
+-- Final key selection:
+--   The final_output step chooses between product_key and product_key_v4 on a row-by-row basis.
+--   When product_key_v4 is accepted, the corresponding v4 fields are promoted to the final
+--   output values for brand_name, major_class, minor_class, super_class, and related metrics.
+
+-- Change log
+-- 23-06-06 | Stakeholder | updated showcase_major_category logic
+-- 23-06-21 | Stakeholder | Added m.region
+-- 25-03-27 | Stakeholder | added enhancements for location data
+-- 25-07-16 | Stakeholder | refactor
+-- 25-09-26 | Stakeholder | added pos_clean_data_flag
+-- 25-12-17 | Stakeholder | penny sale fix
+-- 26-07-23 | Stakeholder | Enhanced transformation for product matching v4 algorithm.
+
+WITH
+products AS (
+  SELECT
+    *
+  FROM ${ref("demo_staging", "products")}
+),
+truth AS (
+  -- Enriches POS data with product, brand, and member attributes
+  SELECT
+    mso.*,
+    m.pos_provider_name,
+    m.last_remit_date,
+    m.days_since_last_remit,
+    b.reporting_brand_name,
+    b.reporting_brand_id,
+    b.reporting_parent_brand,
+    p.showcase_major_class,
+    p.showcase_minor_class,
+    p.showcase_sub_category,
+    p.showcase_major_category,
+    p.t5_t6,
+    p.super_class_description AS super_class,
+    p.major_class_description AS major_class,
+    p.minor_class_description AS minor_class,
+    b.country_of_origin,
+    b.is_luxury AS brand_is_luxury,
+    m.preferred_name,
+    m.division_name,
+    m.division_field_rep_name,
+    m.is_deleted,
+    m.termination_date,
+    IFNULL(m.is_brand_builder,FALSE) AS is_brand_builder,
+    m.is_whirlpool_exclusive,
+    m.is_council,
+    p.total_pos_units,
+    p.mean_unit_price,
+    p.std_unit_price,
+    (ABS(unit_price)-p.mean_unit_price)/IF (p.std_unit_price=0, NULL, p.std_unit_price) AS z_score,
+    IF (mso.penny_sale=TRUE, NULL, price) AS asp_compatible_price,
+    IF (mso.penny_sale=TRUE, NULL, units) AS asp_compatible_units,
+    m.pos_remit_frequency,
+    m.remit_freq_labels,
+    m.pos_remit_method,
+    m.pos_transfer_type,
+    m.remit_status,
+    m.pos_pipeline_type,
+    m.pos_incentive_type,
+    m.consent_provided,
+    IF(mso.penny_sale=TRUE, units, 0) AS total_penny_sale_units,
+    m.region,
+    SAFE_CAST(m.demo_id AS STRING) AS demo_id_str,
+    ------------ algo v4
+    p_v4.total_pos_units AS total_pos_units_v4,
+    p_v4.mean_unit_price AS mean_unit_price_v4,
+    p_v4.std_unit_price AS std_unit_price_v4,
+    (ABS(unit_price_v4)-p_v4.mean_unit_price)/IF (p_v4.std_unit_price=0, NULL, p_v4.std_unit_price) AS z_score_v4,
+    p_v4.showcase_major_class AS showcase_major_class_v4,
+    p_v4.showcase_minor_class AS showcase_minor_class_v4,
+    p_v4.showcase_sub_category AS showcase_sub_category_v4,
+    p_v4.showcase_major_category AS showcase_major_category_v4,
+    p_v4.t5_t6 AS t5_t6_v4,
+    p_v4.super_class_description AS super_class_v4,
+    p_v4.major_class_description AS major_class_v4,
+    p_v4.minor_class_description AS minor_class_v4,
+  FROM ${ref("demo_staging", "pos_incl_excep")} mso
+  LEFT JOIN products p
+    ON p.key = mso.product_key
+  LEFT JOIN ${ref('demo_staging', 'brands')} b
+    ON b.brand_code = mso.brand_code
+  LEFT JOIN ${ref('demo_staging', 'members')} m
+    ON m.demo_id = mso.demo_id
+  ----------------- algo v4
+  LEFT JOIN products p_v4
+  ON p_v4.key = mso.product_key_v4
+),
+comps AS (
+  -- Flags outliers and aggregates error descriptions for POS records
+  SELECT
+    truth.*,
+    IF ((ABS(z_score)>2.5 AND penny_sale=FALSE),TRUE,FALSE) AS z_score_outlier,
+    IF ((ABS(z_score)>2.5 AND penny_sale=FALSE),"Z Score Error", NULL) AS z_score_error,
+    TRIM(CONCAT(zero_price_error, zero_units_error, missing_demo_id_error, missing_date_error,
+    IF ((ABS(z_score)>2.5 AND penny_sale=FALSE),"Z Score Error","")),", ") AS error_description,
+    IF (zero_price=TRUE OR zero_units=TRUE OR missing_demo_id=TRUE OR missing_date=TRUE OR (ABS(z_score)>2.5 AND penny_sale=FALSE), TRUE, FALSE) AS exception,
+    ------------ algo v4
+    IF ((ABS(z_score_v4)>2.5 AND penny_sale=FALSE),TRUE,FALSE) AS z_score_outlier_v4,
+    IF ((ABS(z_score_v4)>2.5 AND penny_sale=FALSE),"Z Score Error", NULL) AS z_score_error_v4,
+    TRIM(CONCAT(zero_price_error, zero_units_error, missing_demo_id_error, missing_date_error,
+    IF ((ABS(z_score_v4)>2.5 AND penny_sale=FALSE),"Z Score Error","")),", ") AS error_description_v4,
+    IF (zero_price=TRUE OR zero_units=TRUE OR missing_demo_id=TRUE OR missing_date=TRUE OR (ABS(z_score_v4)>2.5 AND penny_sale=FALSE), TRUE, FALSE) AS exception_v4,
+
+  FROM truth
+),
+pos_base AS (
+  -- Aggregates POS volume by demo_id and date for valid records
+  SELECT
+    t_date AS date,
+    demo_id,
+    SUM(price) AS volume
+  FROM comps
+  WHERE exception=FALSE
+    AND demo_id IS NOT NULL
+    AND date IS NOT NULL
+  GROUP BY demo_id, date
+  HAVING volume > 0
+),
+comp_logic AS (
+  -- Determines comparable dealers by matching current and prior year POS
+  SELECT
+    cy.date,
+    cy.demo_id,
+    py.date AS py_date,
+    IF(py.date IS NOT NULL,TRUE,FALSE) AS is_comparable_dealer
+  FROM pos_base cy
+  LEFT JOIN pos_base py
+    ON py.demo_id=cy.demo_id
+    AND py.date=DATE_SUB(cy.date,INTERVAL 1 year)
+  ORDER BY demo_id, date
+),
+pos AS (
+  -- Adds comparable dealer flag to POS records
+  SELECT
+    comps.*,
+    IFNULL(comp_logic.is_comparable_dealer,FALSE) AS is_comparable_dealer
+  FROM comps
+  LEFT JOIN comp_logic
+    ON comp_logic.demo_id=comps.demo_id
+    AND comp_logic.date=comps.t_date
+),
+prefin AS (
+  -- Refines exception logic for specific appliance records
+  SELECT
+    * EXCEPT(exception,exception_v4),
+    CASE
+      WHEN super_class="APPLIANCES"
+        AND country_of_origin="USA"
+        AND exception=FALSE
+        AND t5_t6 NOT IN ("APPLIANCE OTHER", "OTHER")
+        AND ABS(unit_price)<=75
+        AND penny_sale=FALSE THEN TRUE
+      ELSE exception
+    END AS exception,
+    CASE
+      WHEN super_class_v4="APPLIANCES"
+        AND country_of_origin="USA"
+        AND exception_v4=FALSE
+        AND t5_t6_v4 NOT IN ("APPLIANCE OTHER", "OTHER")
+        AND ABS(unit_price_v4)<=75
+        AND penny_sale=FALSE THEN TRUE
+      ELSE exception_v4
+    END AS exception_v4
+  FROM pos
+),
+reclassifications AS (
+  -- Prepares product reclassification data with row numbers
+  SELECT
+    *,
+    ROW_NUMBER() OVER (PARTITION BY minor_class_code ORDER BY minor_class_code) AS row_no
+  FROM ${ref('demo_staging', 'reclassifications')}
+),
+reclass AS (
+  -- Selects the first reclassification per minor_class_code
+  SELECT
+    *
+  FROM reclassifications
+  WHERE row_no=1
+),
+fix_z_score_on_generics AS (
+  -- Adjusts super_class and brand fields for generic products and applies reclassifications
+  SELECT
+    fin.* EXCEPT(brand_code,
+      brand_name,
+      parent_brand_code,
+      parent_brand_name,
+      misc_super_class_code,
+      misc_super_class_description,
+      new_super_class_code,
+      new_super_class_description,
+      super_class,
+      exception,
+      error_description,
+      ----------- algo v4
+      -- all fields don't need to be replicated due to different source algorithms
+      exception_v4,
+      error_description_v4
+      ),
+    CASE
+      WHEN product_key IS NOT NULL AND pos_transaction_category IS NOT NULL THEN misc_super_class_description
+      WHEN product_key IS NOT NULL AND super_class IS NULL AND pos_transaction_category IS NULL THEN fin.new_super_class_description
+      WHEN product_key=generic_key THEN fin.new_super_class_description
+      WHEN SPLIT(product_key,":")[OFFSET(0)]="DEMO_GENERIC" THEN "OTHER"
+      ELSE reclass.new_super_class_description
+    END AS super_class,
+    super_class AS old_super_class,
+    IF (SPLIT(product_key,":")[OFFSET(0)]="DEMO_GENERIC","DEMO_GENERIC",fin.brand_code) AS brand_code,
+    IF (SPLIT(product_key,":")[OFFSET(0)]="DEMO_GENERIC","demo",fin.brand_name) AS brand_name,
+    IF (SPLIT(product_key,":")[OFFSET(0)]="DEMO_GENERIC","DEMO_GENERIC",fin.parent_brand_code) AS parent_brand_code,
+    IF (SPLIT(product_key,":")[OFFSET(0)]="DEMO_GENERIC","demo",fin.parent_brand_name) AS parent_brand_name,
+    IF (pos_transaction_category IS NOT NULL OR SPLIT(product_key,":")[OFFSET(0)]="DEMO_GENERIC",FALSE,exception) AS exception,
+    IF (pos_transaction_category IS NOT NULL OR SPLIT(product_key,":")[OFFSET(0)]="DEMO_GENERIC","",error_description) AS error_description,
+    IF (pos_transaction_category IS NOT NULL OR SPLIT(product_key_v4,":")[OFFSET(0)]="DEMO_GENERIC",FALSE,exception) AS exception_v4,
+    IF (pos_transaction_category IS NOT NULL OR SPLIT(product_key_v4,":")[OFFSET(0)]="DEMO_GENERIC","",error_description_v4) AS error_description_v4
+    -----------
+  FROM prefin fin
+  LEFT JOIN products p
+    ON p.key=fin.product_key
+  LEFT JOIN reclass
+    ON reclass.minor_class_code=p.minor_class_code
+),
+---------------
+-- Notes on Z Score:
+-- zscores are generated for products at the transaction level to see outliers (e.grefrigerator sells for 10 bucks but average price is 2000 with a standard deviation of 100 bucks, abs(zscore) will be very high)
+-- transactions with generic product keys get kicked out due to zscore errors
+-- fix_z_score_on_generics will let them pass through since we don't actually know what the product is
+---------------
+z_score_info AS (
+  -- Refines exception and error logic for generics and sets major category for appliances
+  SELECT
+    * EXCEPT(
+      exception,
+      error_description,
+      showcase_major_category,
+      ----------- algo v4
+      exception_v4,
+      error_description_v4,
+      showcase_major_category_v4
+    ),
+    IF(error_description="Z Score Error" AND generic_key=product_key,FALSE,exception) AS exception,
+    IF(error_description="Z Score Error" AND generic_key=product_key,"",error_description) AS error_description,
+    CASE
+      WHEN super_class = 'APPLIANCES'
+        AND (showcase_major_category IS NULL OR LOWER(showcase_major_category) = 'other') THEN 'APPLIANCE OTHER'
+      ELSE showcase_major_category
+    END AS showcase_major_category,
+    IF(error_description_v4="Z Score Error" AND generic_key=product_key_v4,FALSE,exception_v4) AS exception_v4,
+    IF(error_description_v4="Z Score Error" AND generic_key=product_key_v4,"",error_description_v4) AS error_description_v4,
+    CASE
+      WHEN super_class_v4 = 'APPLIANCES'
+        AND (showcase_major_category_v4 IS NULL OR LOWER(showcase_major_category_v4) = 'other') THEN 'APPLIANCE OTHER'
+      ELSE showcase_major_category_v4
+    END AS showcase_major_category_v4
+  FROM fix_z_score_on_generics
+),
+brand_remap AS (
+  -- Remaps brand and product fields for member brands and missing data
+  SELECT
+    * EXCEPT(
+      brand_code,
+      brand_name,
+      parent_brand_code,
+      parent_brand_name,
+      product_key,
+      super_class,
+      ----------- algo v4
+      brand_code_v4,
+      brand_name_v4,
+      parent_brand_code_v4,
+      parent_brand_name_v4,
+      product_key_v4
+      ),
+    CASE
+      WHEN member_brand IS NULL
+        AND product_key IS NULL
+        AND brand_code IS NULL
+        THEN "DEMO_MEMBER"
+      ELSE brand_code
+    END AS brand_code,
+    CASE
+      WHEN member_brand IS NULL
+        AND product_key IS NULL
+        AND brand_code IS NULL
+        THEN "demo MEMBER"
+      ELSE brand_name
+    END AS brand_name,
+    CASE
+      WHEN member_brand IS NULL
+        AND product_key IS NULL
+        AND brand_code IS NULL
+        THEN "DEMO_MEMBER"
+      ELSE parent_brand_code
+    END AS parent_brand_code,
+    CASE
+      WHEN member_brand IS NULL
+        AND product_key IS NULL
+        AND brand_code IS NULL
+        THEN "demo MEMBER"
+      ELSE parent_brand_name
+    END AS parent_brand_name,
+    CASE
+      WHEN member_brand IS NULL
+        AND product_key IS NULL
+        AND brand_code IS NULL
+        THEN "DEMO_MEMBER:DEMO_MEMBER9999"
+      ELSE product_key
+    END AS product_key,
+    CASE
+      WHEN member_brand IS NULL
+        AND product_key IS NULL
+        AND brand_code IS NULL
+        THEN "OTHER"
+      ELSE super_class
+    END AS super_class,
+    ---------- algo v4
+    CASE
+      WHEN member_brand IS NULL
+        AND product_key_v4 IS NULL
+        AND brand_code_v4 IS NULL
+        THEN "DEMO_MEMBER"
+      ELSE brand_code_v4
+    END AS brand_code_v4,
+    CASE
+      WHEN member_brand IS NULL
+        AND product_key_v4 IS NULL
+        AND brand_code_v4 IS NULL
+        THEN "demo MEMBER"
+      ELSE brand_name_v4
+    END AS brand_name_v4,
+    CASE
+      WHEN member_brand IS NULL
+        AND product_key_v4 IS NULL
+        AND brand_code_v4 IS NULL
+        THEN "demo MEMBER"
+      ELSE parent_brand_name_v4
+    END AS parent_brand_name_v4,
+    CASE
+      WHEN member_brand IS NULL
+        AND product_key_v4 IS NULL
+        AND brand_code_v4 IS NULL
+        THEN "demo MEMBER"
+      ELSE parent_brand_code_v4
+    END AS parent_brand_code_v4,
+    CASE
+      WHEN member_brand IS NULL
+        AND product_key_v4 IS NULL
+        AND brand_code_v4 IS NULL
+        THEN "DEMO_MEMBER:DEMO_MEMBER9999"
+      ELSE product_key_v4
+    END AS product_key_v4,
+  FROM z_score_info
+),
+pos_final AS (
+  -- Cleans up location fields, setting empty strings to NULL
+  SELECT
+    * EXCEPT (location, location_id),
+    CASE
+      WHEN location = "" THEN NULL
+      ELSE location
+    END AS location,
+    CASE
+      WHEN location_id = "" THEN NULL
+      ELSE location_id
+    END AS location_id
+  FROM brand_remap
+),
+enhanced_locs AS (
+  -- Enriches POS locations with retail location details and generates unique identifiers
+  SELECT
+    pos_locs.demo_id,
+    CASE
+      WHEN pos_locs.pos_location = "" THEN NULL
+      ELSE pos_locs.pos_location
+    END AS pos_location,
+    CASE
+      WHEN pos_locs.pos_location_id = "" THEN NULL
+      ELSE pos_locs.pos_location_id
+    END AS pos_location_id,
+    -- locs.location_no,
+    locs.location_name as retail_location_name,
+    pos_locs.retail_location_id,
+    locs.location_status as retail_location_status,
+    locs.city AS retail_location_city,
+    locs.state AS retail_location_state,
+    locs.location_zip_code as retail_location_zip_code,
+    locs.location_type as retail_location_type,
+    locs.latitude as retail_latitude,
+    locs.longitude as retail_longitude,
+    CONCAT(
+      IFNULL(CAST(pos_locs.demo_id AS string), ""),
+      "-",
+      IFNULL(CAST(pos_locs.pos_location AS string), ""),
+      "-",
+      IFNULL(CAST(pos_locs.pos_location_id AS string), ""),
+      "-",
+      IFNULL(CAST(locs.location_no AS string), "")
+    ) AS unique_location_identifier
+  FROM ${ref('demo_staging', 'pos_member_retail_locations')} pos_locs
+  INNER JOIN `demo-project.demo_sources.fixed_retail_locations` locs
+    ON locs.location_no = CAST(pos_locs.retail_location_no AS string)
+  WHERE pos_locs.retail_location_no IS NOT NULL
+),
+refined_locations AS (
+  -- Deduplicates enhanced locations by demo_id, location, and zip code
+  SELECT DISTINCT
+    demo_id,
+    pos_location,
+    pos_location_id,
+    retail_location_zip_code,
+    retail_location_id,
+    retail_location_name,
+    retail_location_city,
+    retail_location_state,
+    retail_location_type
+  FROM enhanced_locs
+),
+location_xref as (
+    select
+        demo_id,
+        pos_location,
+        retail_location_no,
+        assigned_demo_id,
+        assigned_retail_location_no
+    from ${ref("demo_staging", "pos_member_location_xref")}
+    -- qualify row_number() over (partition by demo_id, pos_location order by assigned_demo_id) = 1
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY demo_id, UPPER(pos_location) ORDER BY assigned_demo_id) = 1 -- 2026-07-10 | Stakeholder | source table has multiple duplicate records with different case pos_location values. "Tul" and "tul"
+),
+prefin_loc AS (
+  -- Adds location enrichment and exclusion flags to POS records
+  SELECT
+    pos_final.* replace(
+      case
+        when ple.location is not null then 0
+        else coalesce(pos_final.retail_location_no, xref.retail_location_no)
+        end as retail_location_no
+    ),
+    refined_locations.retail_location_zip_code,
+    refined_locations.retail_location_name,
+    refined_locations.retail_location_id,
+    refined_locations.retail_location_city,
+    refined_locations.retail_location_state,
+    refined_locations.retail_location_type,
+    CASE
+      WHEN ple.demo_id is NULL AND ple.location IS NULL THEN FALSE
+      ELSE TRUE
+    END AS pos_location_exclusion
+  FROM pos_final
+  LEFT JOIN (SELECT DISTINCT * FROM ${ref('demo_staging', 'pos_location_exclusions')}) ple
+    USING (demo_id, location)
+  left join location_xref xref
+    on pos_final.demo_id = coalesce(xref.assigned_demo_id, xref.demo_id)
+    AND LOWER(IFNULL(pos_final.location, ""))  = LOWER(IFNULL(xref.pos_location, ""))
+  LEFT JOIN refined_locations
+    ON IFNULL(refined_locations.demo_id, 99999999) = IFNULL(coalesce(xref.demo_id, pos_final.demo_id), 99999999)
+    AND IFNULL(refined_locations.pos_location, "") = IFNULL(pos_final.location, "")
+    AND IFNULL(refined_locations.pos_location_id, "") = IFNULL(pos_final.location_id, "")
+),
+usa_zips AS (
+  -- Aggregates all valid USA zip codes from multiple sources
+  SELECT DISTINCT zip_code
+  FROM (
+    SELECT DISTINCT zip_code
+    FROM  `demo-project.demo_sources.zip_codes_usa`
+    UNION ALL
+    SELECT DISTINCT zip_code
+    FROM  `demo-project.demo_sources.showcase_zip_codes`
+    UNION ALL
+    SELECT DISTINCT origin_zip_code AS zip_code
+    FROM  `demo-project.demo_sources.showcase_zip_codes`
+  )
+),
+prevetted_zips AS (
+  -- Normalizes delivery zip codes for vetting against USA zip codes
+  SELECT
+    -- * EXCEPT (delivery_zip, retail_location_zip_code),
+    * EXCEPT (delivery_zip), -- 2026-04-21 | Stakeholder | retail_location_zip_code is needed as its own field as well. @Stakeholder
+    LPAD(
+      SPLIT(IFNULL(delivery_zip, retail_location_zip_code), "-")[OFFSET(0)],
+      5,
+      "0"
+    ) AS zip_code,
+    -- delivery_zip AS original_delivery_zip
+    delivery_zip AS customer_zip
+  FROM prefin_loc
+),
+zip_vet AS (
+  -- Flags records with vetted USA zip codes
+  SELECT
+    *,
+    usa_zips.zip_code AS vetted_zip_code
+  FROM prevetted_zips
+  LEFT JOIN usa_zips
+    USING (zip_code)
+),
+zip_rename_and_vet AS (
+  -- Renames zip fields and prepares final POS structure
+  SELECT
+    * EXCEPT (zip_code),
+    zip_code AS delivery_zip
+  FROM zip_vet
+),
+buddies AS (
+  -- Joins product details, hashes customer IDs, and finalizes transaction fields
+  SELECT
+    zrv.* EXCEPT(
+      sku,
+      pos_transaction_category,
+      transaction_id,
+      order_number,
+      invoice_number,
+      delivery_zip,
+      vetted_zip_code,
+      super_class,
+      major_class,
+      minor_class,
+      tender_type
+    ),
+    zrv.vetted_zip_code AS delivery_zip,
+    zrv.super_class AS product_super_class,
+    zrv.major_class AS product_major_class,
+    zrv.minor_class AS product_minor_class,
+    IF(
+      CONTAINS_SUBSTR(zrv.tender_type, "@"),
+      NULL,
+      zrv.tender_type
+    ) AS tender_type,
+    products.pn AS sku,
+    CASE
+      WHEN products.description = ""
+      OR products.description IS NULL THEN IFNULL(
+        CONCAT(
+          UPPER(zrv.brand_name),
+          " - ",
+          IFNULL(
+            UPPER(zrv.pos_transaction_category),
+            "MISCELLANEOUS"
+          )
+        ),
+        "MISCELLANEOUS"
+      )
+      ELSE products.description
+    END AS product_description,--enrichment (bring description in pos and make sure to fill in)
+    IFNULL(zrv.pos_transaction_category, "SALE") AS pos_transaction_category,
+    CASE
+      WHEN (
+        zrv.transaction_id IS NULL
+        OR zrv.transaction_id = ""
+      )
+      AND IF(
+        zrv.order_number = "",
+        NULL,
+        zrv.order_number
+      ) IS NOT NULL THEN zrv.order_number
+      WHEN (
+        zrv.transaction_id IS NULL
+        OR zrv.transaction_id = ""
+      )
+      AND IF(
+        zrv.invoice_number = "",
+        NULL,
+        zrv.invoice_number
+      ) IS NOT NULL THEN zrv.invoice_number
+      WHEN (
+        zrv.transaction_id IS NULL
+        OR zrv.transaction_id = ""
+      )
+      AND IF(
+        zrv.order_number = "",
+        NULL,
+        zrv.order_number
+      ) IS NULL
+      AND IF(
+        zrv.invoice_number = "",
+        NULL,
+        zrv.invoice_number
+      ) IS NULL THEN zrv.id
+      ELSE zrv.transaction_id
+    END AS transaction_id, --enrichment (fillers)
+    CASE
+      WHEN (
+        zrv.order_number IS NULL
+        OR zrv.order_number = ""
+      )
+      AND IF(
+        zrv.transaction_id = "",
+        NULL,
+        zrv.transaction_id
+      ) IS NOT NULL THEN zrv.transaction_id
+      WHEN (
+        zrv.order_number IS NULL
+        OR zrv.order_number = ""
+      )
+      AND IF(
+        zrv.invoice_number = "",
+        NULL,
+        zrv.invoice_number
+      ) IS NOT NULL THEN zrv.invoice_number
+      WHEN (
+        zrv.order_number IS NULL
+        OR zrv.order_number = ""
+      )
+      AND IF(
+        zrv.transaction_id = "",
+        NULL,
+        zrv.transaction_id
+      ) IS NULL
+      AND IF(
+        zrv.invoice_number = "",
+        NULL,
+        zrv.invoice_number
+      ) IS NULL THEN zrv.id
+      ELSE zrv.order_number
+    END AS order_number, --enrichment (fillers)
+    CASE
+      WHEN (
+        zrv.invoice_number IS NULL
+        OR zrv.invoice_number = ""
+      )
+      AND IF(
+        zrv.transaction_id = "",
+        NULL,
+        zrv.transaction_id
+      ) IS NOT NULL THEN zrv.transaction_id
+      WHEN (
+        zrv.invoice_number IS NULL
+        OR zrv.invoice_number = ""
+      )
+      AND IF(
+        zrv.order_number = "",
+        NULL,
+        zrv.order_number
+      ) IS NOT NULL THEN zrv.order_number
+      WHEN (
+        zrv.invoice_number IS NULL
+        OR zrv.invoice_number = ""
+      )
+      AND IF(
+        zrv.transaction_id = "",
+        NULL,
+        zrv.transaction_id
+      ) IS NULL
+      AND IF(
+        zrv.order_number = "",
+        NULL,
+        zrv.order_number
+      ) IS NULL THEN zrv.id
+      ELSE zrv.invoice_number
+    END AS invoice_number,
+    SHA512(
+      IF(
+        zrv.customer_id = "",
+        NULL,
+        zrv.customer_id
+      )
+    ) AS customer_hash
+  FROM zip_rename_and_vet zrv
+  LEFT JOIN products
+    ON products.key = zrv.product_key
+),
+buddies_and_zip AS (
+  -- Finalizes null handling and adds delivery location details from zip code reference
+  SELECT
+    buddies.* EXCEPT(
+      id,
+      parent_brand_name,
+      parent_brand_code,
+      brand_name,
+      brand_code,
+      product_key,
+      sku,
+      delivery_zip,
+      product_super_class,
+      product_major_class,
+      product_minor_class,
+      product_description,
+      pos_transaction_category,
+      transaction_id,
+      order_number,
+      invoice_number,
+      customer_type,
+      ----------- algo v4
+      parent_brand_name_v4,
+      parent_brand_code_v4,
+      brand_name_v4,
+      brand_code_v4,
+      product_key_v4,
+      super_class_v4,
+      major_class_v4,
+      minor_class_v4
+    ),
+    IF(buddies.id = "", NULL, buddies.id) AS id,
+    IF(
+      buddies.parent_brand_name = "",
+      NULL,
+      buddies.parent_brand_name
+    ) AS parent_brand_name,
+    IF(
+      buddies.parent_brand_code = "",
+      NULL,
+      buddies.parent_brand_code
+    ) AS parent_brand_code,
+    IF(buddies.brand_name = "", NULL, buddies.brand_name) AS brand_name,
+    IF(buddies.brand_code = "", NULL, buddies.brand_code) AS brand_code,
+    IF(
+      buddies.product_key = "",
+      NULL,
+      buddies.product_key
+    ) AS product_key,
+    IF(buddies.sku = "", NULL, buddies.sku) AS sku,
+    IF(
+      buddies.delivery_zip = "",
+      NULL,
+      buddies.delivery_zip
+    ) AS delivery_zip,
+    IF(
+      buddies.product_super_class = "",
+      NULL,
+      buddies.product_super_class
+    ) AS super_class,
+    IF(
+      buddies.product_major_class = "",
+      NULL,
+      buddies.product_major_class
+    ) AS major_class,
+    IF(
+      buddies.product_minor_class = "",
+      NULL,
+      buddies.product_minor_class
+    ) AS minor_class,
+    IF(
+      buddies.product_description = "",
+      NULL,
+      buddies.product_description
+    ) AS product_description,
+    IF(
+      buddies.pos_transaction_category = "",
+      NULL,
+      buddies.pos_transaction_category
+    ) AS pos_transaction_category,
+    IF(
+      buddies.transaction_id = "",
+      NULL,
+      buddies.transaction_id
+    ) AS transaction_id,
+    IF(
+      buddies.order_number = "",
+      NULL,
+      buddies.order_number
+    ) AS order_number,
+    IF(
+      buddies.invoice_number = "",
+      NULL,
+      buddies.invoice_number
+    ) AS invoice_number,
+    IF(
+      buddies.customer_type = "",
+      NULL,
+      buddies.customer_type
+    ) AS customer_type, --enrich this later (figure out contractor .... e.g. is it distinguishable from invoice number? )
+    TO_BASE64(buddies.customer_hash) AS customer_id_anonymous,
+    zip_codes.city AS delivery_city,
+    zip_codes.state AS delivery_state,
+    zip_codes.latitude AS delivery_latitude,
+    zip_codes.longitude AS delivery_longitude,
+    ------- algo v4
+    IF(buddies.parent_brand_name_v4 = "", NULL, buddies.parent_brand_name_v4) AS parent_brand_name_v4,
+    IF(buddies.parent_brand_code_v4 = "", NULL, buddies.parent_brand_code_v4) AS parent_brand_code_v4,
+    IF(buddies.brand_name_v4 = "", NULL, buddies.brand_name_v4) AS brand_name_v4,
+    IF(buddies.brand_code_v4 = "", NULL, buddies.brand_code_v4) AS brand_code_v4,
+    IF(buddies.product_key_v4 = "", NULL, buddies.product_key_v4) AS product_key_v4,
+    IF(buddies.super_class_v4 = "", NULL, buddies.super_class_v4) AS super_class_v4,
+    IF(buddies.major_class_v4 = "", NULL, buddies.major_class_v4) AS major_class_v4,
+    IF(buddies.minor_class_v4 = "", NULL, buddies.minor_class_v4) AS minor_class_v4,
+  FROM buddies
+  LEFT JOIN `demo-project.demo_sources.zip_codes_usa` zip_codes --enrichment (deliver zip geolocation. run zip_codes_dot_org_for_data_enrichment.py for scrape on missing delivery zip info)
+    ON zip_codes.zip_code = buddies.delivery_zip
+),
+pos_clean_data_flag AS (
+-- |                    | good data (1) | bad data (0) |
+-- |--------------------|:------------:|:------------:|
+-- | exception          | FALSE        | TRUE         | <!-- TRUE means exception is present, so it's bad data -->
+-- | exception_excluded | FALSE        | TRUE         | <!-- TRUE means exception (excluded) is present, so it's bad data -->
+-- | pos_location_exception | FALSE    | TRUE         | <!-- TRUE means a positional/location exception is present, so it's bad data -->
+  SELECT
+    *,
+    CASE
+      WHEN penny_sale = TRUE AND ABS(z_score) > 2.5 THEN 0 -- 2025-12-17 | Stakeholder | penny sale fix.
+      WHEN (exception IS FALSE AND exception_excluded IS FALSE AND pos_location_exclusion IS FALSE) THEN 1
+      ELSE 0
+      END AS pos_clean_data_flag,
+    CASE
+      WHEN penny_sale = TRUE AND ABS(z_score_v4) > 2.5 THEN 0 -- 2025-12-17 | Stakeholder | penny sale fix.
+      WHEN (exception_v4 IS FALSE AND exception_excluded IS FALSE AND pos_location_exclusion IS FALSE) THEN 1
+      ELSE 0
+      END AS pos_clean_data_flag_v4
+  FROM buddies_and_zip
+),
+simp_sup_class AS (
+  -- Simplifies super_class values for reporting
+SELECT
+  *,
+  CASE
+    WHEN IFNULL(super_class, "") IN (
+      'HOME',
+      'HVAC',
+      'LAWN AND GARDEN',
+      'HARDWARE',
+      'AUTOMOBILE',
+      ''
+    ) THEN 'OTHER'
+    WHEN super_class = "MISCELLANEOUS" THEN "OPERATIONAL SERVICES"
+    ELSE super_class
+    END AS super_class_simplified,
+  CASE
+    WHEN IFNULL(super_class_v4, "") IN (
+      'HOME',
+      'HVAC',
+      'LAWN AND GARDEN',
+      'HARDWARE',
+      'AUTOMOBILE',
+      ''
+    ) THEN 'OTHER'
+    WHEN super_class_v4 = "MISCELLANEOUS" THEN "OPERATIONAL SERVICES"
+    ELSE super_class_v4
+    END AS super_class_simplified_v4
+FROM
+  pos_clean_data_flag
+),
+penny_sale_fix AS (
+  -- 2025-12-17 | Stakeholder | Penny sale fix
+  SELECT
+    * REPLACE(
+      CASE
+        WHEN penny_sale = TRUE AND ABS(z_score) > 2.5 THEN TRUE
+        ELSE exception
+      END AS exception,
+      CASE
+        WHEN penny_sale = TRUE AND ABS(z_score_v4) > 2.5 THEN TRUE
+        ELSE exception_v4
+      END AS exception_v4
+    )
+  FROM simp_sup_class
+),
+generic_9999 AS (
+  SELECT
+    pos.*,
+    RIGHT(product_key, 4) = "9999"
+    OR LEFT(product_key, 6) = "CLASS_"
+    OR LEFT(product_key, 11) = "DEMO_MEMBER:"
+    OR LEFT(product_key, 5) = "MISC:" AS current_is_generic_9999,
+    RIGHT(product_key_v4, 4) = "9999"
+    OR LEFT(product_key_v4, 6) = "CLASS_"
+    OR LEFT(product_key_v4, 11) = "DEMO_MEMBER:"
+    OR LEFT(product_key_v4, 5) = "MISC:" AS new_is_generic_9999,
+    product_key = product_key_v4 AS same_keys,
+  FROM
+    penny_sale_fix pos
+),
+almost AS (
+  SELECT
+    *,
+    CASE
+      WHEN product_key_v4 IS NULL
+      AND product_key IS NULL THEN "both_missing"
+      WHEN product_key_v4 IS NOT NULL
+      AND product_key IS NULL THEN "current_missing"
+      WHEN product_key_v4 IS NULL
+      AND product_key IS NOT NULL THEN "new_missing"
+      WHEN product_key_v4 = product_key THEN "same_key"
+      WHEN product_key_v4 IS NOT NULL
+      AND product_key IS NOT NULL
+      AND new_is_generic_9999 = TRUE
+      AND current_is_generic_9999 = TRUE THEN "both generic"
+      WHEN product_key_v4 IS NOT NULL
+      AND product_key IS NOT NULL
+      AND new_is_generic_9999 = TRUE THEN "generic_new"
+      WHEN (
+        product_key_v4 IS NOT NULL
+        AND product_key IS NOT NULL
+        AND current_is_generic_9999 = TRUE
+      ) THEN "generic_current"
+      WHEN product_key_v4 IS NOT NULL
+      AND product_key IS NOT NULL
+      AND product_key_v4 != product_key THEN "different_products"
+    END AS status,
+  FROM
+    generic_9999
+),
+xrefs AS (
+  SELECT
+    almost.*,
+    CONCAT(xref.brand_code, ":", xref.brand_code, "9999") AS xref_generic_key,
+    xref.member_brand AS xref_member_brand,
+    xref.brand_code AS xref_brand_code,
+    brands.parent_brand_name AS xref_parent,
+    brands.brand_name AS xref_brand_name,
+    brands.parent_brand_code AS xref_parent_brand_code,
+    brands.parent_brand_name AS xref_parent_brand_name,
+  FROM
+    almost
+  LEFT JOIN (SELECT DISTINCT
+              demo_id,
+              brand_code,
+              member_brand
+            FROM `demo-project.demo_staging.pos_member_brand_brand_code_xref`
+            ) xref
+    ON xref.demo_id = almost.demo_id
+    AND TRIM(almost.member_brand) = TRIM(xref.member_brand)
+  LEFT JOIN demo_staging.brands
+    ON brands.brand_code = xref.brand_code
+),
+summary AS (
+  SELECT
+    *,
+    CASE
+      WHEN xref_parent IS NOT NULL
+      AND xref_parent = parent_brand_name_v4 THEN "pass"
+      WHEN xref_parent IS NULL THEN "no xref"
+      WHEN xref_parent IS NOT NULL
+      AND xref_parent != IFNULL(parent_brand_name_v4, "") THEN "fail"
+    END AS new_xref_pass_fail,
+    CASE
+      WHEN xref_parent IS NOT NULL
+      AND xref_parent = parent_brand_name THEN "pass"
+      WHEN xref_parent IS NULL THEN "no xref"
+      WHEN xref_parent IS NOT NULL
+      AND xref_parent != IFNULL(parent_brand_name, "") THEN "fail"
+    END AS current_xref_pass_fail
+  FROM
+    xrefs
+),
+final_key AS (
+  SELECT
+    *,
+    CASE
+      WHEN current_is_generic_9999 = FALSE
+        AND new_xref_pass_fail = "fail"
+        AND current_xref_pass_fail = "pass"
+        AND product_key IS NOT NULL
+        AND product_key_v4 IS NOT NULL THEN FALSE
+      WHEN current_is_generic_9999 = FALSE
+        AND new_is_generic_9999 = TRUE
+        AND new_xref_pass_fail = "pass"
+        AND current_xref_pass_fail = "pass"
+        AND product_key IS NOT NULL THEN FALSE
+      WHEN current_is_generic_9999 = FALSE
+        AND new_is_generic_9999 = TRUE
+        AND brand_name = upper(split(member_brand)[offset(0)]) THEN FALSE
+      WHEN product_key_v4 IS NOT NULL THEN TRUE
+      ELSE FALSE
+    END AS use_v4
+  FROM summary
+),
+final_output AS (
+  SELECT
+    * EXCEPT(
+      product_key_v4,
+      brand_name_v4,
+      parent_brand_name_v4,
+      parent_brand_code_v4,
+      major_class_v4,
+      minor_class_v4,
+      super_class_v4,
+      showcase_major_category_v4,
+      showcase_minor_class_v4,
+      showcase_sub_category_v4,
+      t5_t6_v4,
+      total_pos_units_v4,
+      mean_unit_price_v4,
+      std_unit_price_v4,
+      z_score_v4,
+      super_class_simplified_v4,
+      unit_price_v4,
+      product_volume_v4,
+      product_average_unit_price_v4,
+      product_revenue_v4,
+      showcase_major_class_v4,
+      z_score_outlier_v4,
+      z_score_error_v4,
+      exception_v4,
+      error_description_v4,
+      brand_code_v4,
+      pos_clean_data_flag_v4,
+      ------- not needed in final, used for debugging and testing
+      use_v4,
+      xref_parent,
+      xref_generic_key,
+      xref_brand_name,
+      xref_brand_code,
+      xref_parent_brand_code,
+      xref_parent_brand_name,
+      current_is_generic_9999,
+      current_xref_pass_fail,
+      new_is_generic_9999,
+      new_xref_pass_fail,
+      same_keys,
+      status,
+      xref_member_brand
+      ------
+    )
+    -- REPLACE - judgement if use_v4 is true, then use the v4 value, else old value, else value from xref.
+    -- normalized with NULLIF and enhanced with COALESCE to avoid empty strings and NULLs.
+    REPLACE(
+        CASE WHEN use_v4 THEN COALESCE( NULLIF(product_key_v4, ""), NULLIF(product_key, ""), NULLIF(xref_generic_key, "") ) ELSE COALESCE( NULLIF(product_key, ""), NULLIF(xref_generic_key, "") ) END AS product_key,
+        CASE WHEN use_v4 THEN COALESCE( NULLIF(brand_code_v4, ""), NULLIF(brand_code, ""), NULLIF(xref_brand_code, "") ) ELSE COALESCE( NULLIF(brand_code, ""), NULLIF(xref_brand_code, "") ) END AS brand_code,
+        CASE WHEN use_v4 THEN COALESCE( NULLIF(brand_name_v4, ""), NULLIF(brand_name, ""), NULLIF(xref_brand_name, "") ) ELSE COALESCE( NULLIF(brand_name, ""), NULLIF(xref_brand_name, "") ) END AS brand_name,
+        CASE WHEN use_v4 THEN COALESCE( NULLIF(parent_brand_name_v4, ""), NULLIF(parent_brand_name, ""), NULLIF(xref_parent_brand_name, "") ) ELSE COALESCE( NULLIF(parent_brand_name, ""), NULLIF(xref_parent_brand_name, "") ) END AS parent_brand_name,
+        CASE WHEN use_v4 THEN COALESCE( NULLIF(parent_brand_code_v4, ""), NULLIF(parent_brand_code, ""), NULLIF(xref_parent_brand_code, "") ) ELSE COALESCE( NULLIF(parent_brand_code, ""), NULLIF(xref_parent_brand_code, "") ) END AS parent_brand_code,
+        CASE WHEN use_v4 THEN COALESCE( NULLIF(super_class_simplified_v4, ""), NULLIF(super_class_simplified, "") ) ELSE NULLIF(super_class_simplified, "") END AS super_class_simplified,
+        CASE WHEN use_v4 THEN COALESCE( NULLIF(showcase_major_class_v4, ""), NULLIF(showcase_major_class, "") ) ELSE NULLIF(showcase_major_class, "") END AS showcase_major_class,
+        CASE WHEN use_v4 THEN COALESCE( NULLIF(showcase_major_category_v4, ""), NULLIF(showcase_major_category, "") ) ELSE NULLIF(showcase_major_category, "") END AS showcase_major_category,
+        CASE WHEN use_v4 THEN COALESCE( NULLIF(showcase_minor_class_v4, ""), NULLIF(showcase_minor_class, "") ) ELSE NULLIF(showcase_minor_class, "") END AS showcase_minor_class,
+        CASE WHEN use_v4 THEN COALESCE( NULLIF(showcase_sub_category_v4, ""), NULLIF(showcase_sub_category, "") ) ELSE NULLIF(showcase_sub_category, "") END AS showcase_sub_category,
+        CASE WHEN use_v4 THEN COALESCE( NULLIF(t5_t6_v4, ""), NULLIF(t5_t6, "") ) ELSE NULLIF(t5_t6, "") END AS t5_t6,
+        CASE WHEN use_v4 THEN COALESCE(total_pos_units_v4, total_pos_units) ELSE total_pos_units END AS total_pos_units,
+        CASE WHEN use_v4 THEN COALESCE(mean_unit_price_v4, mean_unit_price) ELSE mean_unit_price END AS mean_unit_price,
+        CASE WHEN use_v4 THEN COALESCE(std_unit_price_v4, std_unit_price) ELSE std_unit_price END AS std_unit_price,
+        CASE WHEN use_v4 THEN COALESCE(unit_price_v4, unit_price) ELSE unit_price END AS unit_price,
+        CASE WHEN use_v4 THEN COALESCE(product_volume_v4, product_volume) ELSE product_volume END AS product_volume,
+        CASE WHEN use_v4 THEN COALESCE(product_average_unit_price_v4, product_average_unit_price) ELSE product_average_unit_price END AS product_average_unit_price,
+        CASE WHEN use_v4 THEN COALESCE(product_revenue_v4, product_revenue) ELSE product_revenue END AS product_revenue,
+        CASE WHEN use_v4 THEN COALESCE(z_score_v4, z_score) ELSE z_score END AS z_score,
+        CASE WHEN use_v4 THEN COALESCE(z_score_outlier_v4, z_score_outlier) ELSE z_score_outlier END AS z_score_outlier,
+        CASE WHEN use_v4 THEN COALESCE(z_score_error_v4, z_score_error) ELSE z_score_error END AS z_score_error,
+        CASE WHEN use_v4 THEN COALESCE(exception_v4, exception) ELSE exception END AS exception,
+        CASE WHEN use_v4 THEN COALESCE( NULLIF(error_description_v4, ""), NULLIF(error_description, "") ) ELSE NULLIF(error_description, "") END AS error_description,
+        CASE WHEN use_v4 THEN COALESCE(pos_clean_data_flag_v4, pos_clean_data_flag) ELSE pos_clean_data_flag END AS pos_clean_data_flag
+    )
+FROM final_key
+),
+super_class_assignment AS (
+  SELECT
+    f.* REPLACE(
+      COALESCE(p.super_class_description, bc.new_super_class_code) AS super_class,
+      p.minor_class_description AS minor_class,
+      p.major_class_description AS major_class
+    )
+  FROM final_output f
+  LEFT JOIN products p
+    ON f.product_key = p.key
+  -- This is used to fill in super_class values for products that are not in the products table
+  -- but have a brand_code that is mapped to a super_class in the brand_categorizations table.
+  LEFT JOIN ${ref("demo_staging", "brand_categorizations")} bc
+    ON p.brand_code = bc.brand_code
+    AND split(p.key,":")[offset(1)] not in (
+      "PARTS",
+      "SERVICE",
+      "INSTALL",
+      "WARRANTY",
+      "DELIVERY",
+      "LABOR",
+      "CREDITS"
+      )
+)
+
+SELECT
+  *
+FROM super_class_assignment

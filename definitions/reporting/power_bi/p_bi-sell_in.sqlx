@@ -1,0 +1,120 @@
+config {
+  type: "table",
+  name: "sell_in",
+  schema: "demo_reporting",
+  description: "Reporting model for sell-in performance, vendor relationship analysis, and product-level channel performance.",
+  tags: ["reporting",
+    "sell_in",
+    "p_bi 1 hour"
+  ],
+  columns: {
+    demo_id_str: "Field demo_id converted to STRING for Power BI use. ",
+    is_ci: "Custom Integration flag - BOOL"
+  },
+  assertions: {
+    nonNull: ["general_category"]
+  },
+  dependOnDependencyAssertions: true,
+}
+
+
+-- Change log
+-- 2024-02-06 | Stakeholder | added is_deleted_vendor
+-- 2024-09-11 | Stakeholder | Combined OTHER showcase major and sub category with the APPLIANCE OTHER per Stakeholder's request.
+-- 2025-11-24 | Stakeholder | Updated to match data_studio logic. Unsure why they were different but one was updated and the other was not.
+-- 2025-12-08 | Stakeholder | demo_platform Vendor rework.
+
+WITH
+core AS (
+  SELECT
+    s.*,
+    b.country_of_origin,
+    b.reporting_brand_id,
+    b.reporting_brand_name,
+    b.reporting_parent_brand,
+    m.company_name AS member_name,
+    m.division_group AS division_name,
+    NULL AS division_field_rep_id,
+    m.field_rep AS msm,
+    m.brand_builder AS is_brand_builder,
+    m.bb_council AS is_council,
+    m.is_whirlpool_exclusive,
+    m.region_name AS region,
+    m.rentdirect AS is_rto,
+    m.industry_name AS member_category,
+    COALESCE(vens.name, dist.name) AS vendor_name,
+    dist.name AS distributor_name,
+    COALESCE(IF(dist.name IS NOT NULL, CONCAT(vens.name, " - ", dist.name), vens.name), dist.name) AS full_vendor_name,
+    COALESCE(vens.general_category, dist.general_category) AS general_category,
+    b.parent_brand_name AS parent_brand,
+    b.brand_code,
+    b.brand_name,
+    -- p.super_class_code,
+    -- p.super_class_description, -- 2025-11-24 | Updated to match data_studio logic
+    IF(product_key IN ("LG:LG9999", "SAMSUNG:SAMSUNG9999") AND LEFT(source_file_brand, 7) = "AZIONE_", "ELEC", p.super_class_code) AS super_class_code,
+    IF(product_key IN ("LG:LG9999", "SAMSUNG:SAMSUNG9999") AND LEFT(source_file_brand, 7) = "AZIONE_", "ELECTRONICS", p.super_class_description) AS super_class_description,
+    p.major_class_code,
+    p.major_class_description,
+    p.minor_class_code,
+    p.minor_class_description,
+    CASE
+      WHEN s.vendor_id = 13413 AND product_key IS NULL THEN "LAUNDRY"
+      WHEN UPPER(p.showcase_major_category) = "OTHER" THEN "APPLIANCE OTHER"
+      ELSE p.showcase_major_category
+    END AS showcase_major_category, -- 2024-09-11 | Stakeholder
+    CASE
+      WHEN s.vendor_id = 13413 AND product_key IS NULL THEN "LAUNDRY"
+      WHEN UPPER(p.showcase_sub_category) = "OTHER" THEN "APPLIANCE OTHER"
+      ELSE p.showcase_sub_category
+    END AS showcase_sub_category, -- 2024-09-11 | Stakeholder
+    p.showcase_major_class,
+    p.showcase_minor_class,
+    p.t5_t6,
+    b.is_luxury AS brand_is_luxury,
+    b.vendor_alias,
+    SAFE_CAST(s.demo_id AS STRING) AS demo_id_str,
+    COALESCE(vens.is_deleted,dist.is_deleted, FALSE) AS is_deleted_vendor, -- 2024-02-06 | Stakeholder
+    IF(is_oasys OR is_ellipsys, TRUE, FALSE) AS is_oasys_ellipsys
+  FROM ${ref("demo_staging", "sell_in")} AS s
+  LEFT JOIN ${ref("demo_staging", "products")} AS p ON s.product_key = p.key
+  LEFT JOIN ${ref("demo_staging", "brands")} AS b ON p.brand_code = b.brand_code
+  LEFT JOIN ${ref('demo_staging_netsuite','netsuite_vendors')} AS vens ON s.vendor_id = vens.id
+  LEFT JOIN ${ref('demo_staging_netsuite','netsuite_vendors')} AS dist ON s.distributor_id = dist.id
+  LEFT JOIN ${ref("demo_staging_netsuite", "membership")} AS m ON s.demo_id = m.demo_id
+  -- WHERE EXTRACT(YEAR FROM date) >= EXTRACT(YEAR FROM CURRENT_DATE) - 6 -- 2026-03-23 | Stakeholder - @Stakeholder & @Stakeholder confirmed we want data on the BQ side to go back to 2019 and then filtered later in PBI.
+  WHERE EXTRACT(YEAR FROM date) >= 2019
+),
+
+misc_rename AS (
+  SELECT
+    * REPLACE (
+      COALESCE(super_class_description, "Miscellaneous") AS super_class_description,
+      COALESCE(major_class_description, "Miscellaneous") AS major_class_description
+    )
+  FROM core
+),
+
+simp_sup_class AS (
+  -- Simplifies super_class values for reporting
+  SELECT
+    *,
+    CASE
+      WHEN COALESCE(super_class_description, "") IN (
+        "HOME",
+        "HVAC",
+        "LAWN AND GARDEN",
+        "HARDWARE",
+        "AUTOMOBILE",
+        ""
+      ) THEN "OTHER"
+      WHEN super_class_description = "MISCELLANEOUS" THEN "OPERATIONAL SERVICES"
+      ELSE super_class_description
+    END AS super_class_description_simplified
+  FROM
+    misc_rename
+)
+
+SELECT
+  *
+FROM simp_sup_class
+where not (ifnull(distributor_id,0) = 13416 and lower(source_file_brand) in ('speed queen')) -- removes incorrect or unmapped speed queen items from o'rourke

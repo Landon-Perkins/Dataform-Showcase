@@ -1,0 +1,174 @@
+config {
+  type: "table",
+  name: "customer",
+  schema: "demo_staging_netsuite",
+  description: "Customer level data from demo_platform.",
+  bigquery: {
+    labels: {
+      scheduler: "dataform",
+      has_snapshot: "true",
+      author: "Stakeholder"
+    }
+  },
+  tags: [
+    "demo_staging_netsuite",
+    "crm_netsuite"
+  ],
+  assertions: {
+    uniqueKey: ["customer_id"],
+    nonNull: ["customer_id"],
+    rowConditions: []
+  },
+  columns: {
+    customer_mattress_status: "This field is a driver for member dues billing that SSB is going to pay.",
+    parent_customer_id: "This field indicates the record is a sub-customer of another customer. This is requeried when a customer has multiple subscriptions of the same level.",
+  }
+}
+
+
+
+with
+emp as (
+    SELECT DISTINCT id, entityid AS name, title, email
+    FROM `demo-project.netsuite_suiteanalytics.employee`
+    WHERE _fivetran_deleted = FALSE
+)
+
+SELECT
+  c.entityid AS customer_id,
+  c.companyname AS company_name,
+  c.custentity_dba AS company_alt_name,
+  c.custentity_previous_demo_id AS previous_demo_id,
+  c.id AS netsuite_id,
+  c.entitynumber AS customer_id_check,
+  c.entitystatus AS customer_status_id,
+  entity_status.name AS customer_status,
+  entity_status.entitytype AS customer_status_type,
+  c.custentity_lrs_customer_type AS lrs_customer_type,
+  c.custentity_esc_no_of_employees AS number_of_employees,
+  DATE(c.lastmodifieddate) AS last_modified_date,
+  DATE(c.datecreated) AS date_created,
+  CASE
+    WHEN c.isinactive = "T" THEN TRUE
+    ELSE FALSE
+  END AS is_inactive_customer,
+  CASE
+    WHEN c.custentity_internal_announcement_only = "T" THEN TRUE
+    ELSE FALSE
+  END AS is_internal_announcement_only,
+  c.custentity_number_locations AS number_of_locations,
+  c.custentity_esc_industry AS industry,
+  indust.name AS industry_name,
+  c.custentity_est_annual_revenue2 AS yearly_retail_revenue_bucket,-- don't need both
+  -- c.custentity_est_annual_revenue2 AS annual_revenue_id, --! don't need both
+  revenue.name AS revenue,
+  curr.name AS current_group,
+  newgr.name AS new_group,
+  -- fcg.name AS former_or_current_group_name,--! clean up, maybe obsolete
+  c.custentity_current_pos_provider AS current_pos_provider,
+  c.custentity_ci_level AS ci_level,
+  c.url AS website_address,
+  address.addr1 AS address_1,
+  address.addr2 AS address_2,
+  address.addr3 AS address_3,
+  address.city,
+  address.state,
+  address.zip AS zip_code,
+  address.country,
+  address.addrphone AS company_phone,
+  CASE
+    WHEN c.custentity_2663_direct_debit = "T" THEN TRUE
+    ELSE FALSE
+  END AS is_direct_debit,
+  quad.name AS quad_name,
+  c.email AS primary_email,
+  CASE
+    WHEN c.custentity_do_not_contact = "T" THEN TRUE
+    ELSE FALSE
+  END AS is_do_not_contact,
+  CASE
+    WHEN c.custentity_linked_member = "T" THEN TRUE
+    ELSE FALSE
+    END AS is_linked_member,
+  c.custentity_linked_member_demo_id AS linked_member_entity_id,
+  -- management assignment fields
+  recruiter.name AS recruiter, -- Recruiter = old lead closer | Digital Sales Rep
+  assist_closer.name AS assist_closer,
+  sales_rep.name AS sales_rep,
+  onboarder.name AS onboarder,
+  cam.name AS cam,
+  field_rep.name AS field_rep,
+  designer.name AS designer,
+  recruiter.title AS recruiter_role,
+  assist_closer.title AS assist_closer_role,
+  sales_rep.title AS sales_rep_role,
+  onboarder.title AS onboarder_role,
+  cam.title AS cam_role,
+  field_rep.title AS field_rep_role,
+  designer.title AS designer_role,
+  recruiter.email AS recruiter_email,
+  assist_closer.email AS assist_closer_email,
+  sales_rep.email AS sales_rep_email,
+  onboarder.email AS onboarder_email,
+  cam.email AS cam_email,
+  field_rep.email AS field_rep_email,
+  designer.email AS designer_email,
+  -- /management assignment fields
+  c2.entityid AS parent_customer_id,
+  c.custentity_region_field AS customer_region_id,
+  r.name as customer_region_name,
+  c.custentity_division AS customer_division_id,
+  d.name as customer_division_name,
+  am.name AS customer_mattress_status,
+FROM `demo-project.netsuite_suiteanalytics.customer` AS c
+LEFT JOIN `demo-project.netsuite_suiteanalytics.customer` AS c2
+  ON c.parent = c2.id
+LEFT JOIN `demo-project.netsuite_suiteanalytics.entitystatus` AS entity_status
+  ON
+    c.entitystatus = entity_status.key
+    AND entity_status._fivetran_deleted = FALSE
+LEFT JOIN `demo-project.netsuite_suiteanalytics.customlist_esc_industries` AS indust
+  ON
+    c.custentity_esc_industry = indust.id
+    AND indust._fivetran_deleted = FALSE
+LEFT JOIN `demo-project.netsuite_suiteanalytics.customlist_annual_revenue` AS revenue
+  ON
+    c.custentity_est_annual_revenue2 = revenue.id
+    AND revenue._fivetran_deleted = FALSE
+LEFT JOIN `demo-project.netsuite_suiteanalytics.customlist_former_or_current_group` AS curr
+  ON
+    c.custentity_current_group = curr.id
+    AND curr._fivetran_deleted = FALSE
+LEFT JOIN `demo-project.netsuite_suiteanalytics.customlist_former_or_current_group` AS newgr
+  ON
+    c.custentity_new_group = newgr.id
+    AND newgr._fivetran_deleted = FALSE
+LEFT JOIN `demo-project.netsuite_suiteanalytics.entityaddress` AS address
+  ON
+    c.defaultbillingaddress = address.nkey
+    AND address._fivetran_deleted = FALSE
+-- management assignments
+LEFT JOIN emp AS recruiter      ON c.custentity_lead_closer              = recruiter.id
+LEFT JOIN emp AS assist_closer  ON c.custentity_assist_closer            = assist_closer.id
+LEFT JOIN emp AS sales_rep      ON c.custentity_customer_sales_rep       = sales_rep.id
+LEFT JOIN emp AS onboarder      ON c.custentity_customer_onboarder       = onboarder.id
+LEFT JOIN emp AS cam            ON c.custentity_customer_account_manager = cam.id
+LEFT JOIN emp AS field_rep      ON c.custentity_customer_field_rep       = field_rep.id
+LEFT JOIN emp AS designer       ON c.custentity_customer_designer        = designer.id
+-- /management assignments
+LEFT JOIN `demo-project.netsuite_suiteanalytics.customlist_list_regions` r
+  ON c.custentity_region_field = r.id
+  AND r._fivetran_deleted = FALSE
+LEFT JOIN `demo-project.netsuite_suiteanalytics.customlist_division_list`  d
+  ON d.id = c.custentity_division
+  AND d._fivetran_deleted = FALSE
+LEFT JOIN `demo-project.netsuite_suiteanalytics.customlist_quad_rating` quad
+  ON c.custentity_quad_rating = quad.id
+  AND quad._fivetran_deleted = FALSE
+LEFT JOIN `demo-project.netsuite_suiteanalytics.customlist_mattress` am
+  ON c.custentity_is_mattress = am.id
+  AND am._fivetran_deleted = FALSE
+
+WHERE
+  c.custentity_lrs_customer_type = 3
+  AND c._fivetran_deleted = FALSE

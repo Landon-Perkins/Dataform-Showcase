@@ -1,0 +1,744 @@
+config {
+  type: "table",
+  name: "customer_omnibus",
+  schema: "demo_staging_netsuite",
+  description: "All-in-one table for customer data and all associated membership and digital service subscription data. Subscription grain: one row per customer–service–subscription combination, unioned across all service and subscription types.",
+  bigquery: {
+    labels: {
+      scheduler: "dataform",
+      has_snapshot: "false",
+      author: "Stakeholder"
+    }
+  },
+  tags: [
+    "demo_staging_netsuite",
+    "crm_netsuite",
+    "s_o_t 1 hour"
+  ],
+  assertions: {
+    uniqueKeys: [
+      ["customer_id", "service_category", "service_id", "subscription_id"]
+    ],
+    nonNull: ["customer_id"],
+    rowConditions: []
+  },
+  columns: {
+    // --- Discriminators ---
+    service_category: "Top-level classification of the service record. Values: 'membership' (from customer_membership_services) or 'digital_service' (from customer_website_services).",
+    // --- Digital-only customer fields (NULL for membership rows) ---
+    digital_customer_id: "The customer's entity ID as stored in the digital/RWS CRM system. Sourced from customer_website_services. NULL for membership rows.",
+    rws_crm_id: "The customer's ID in the RWS CRM platform. Sourced from customer_website_services. NULL for membership rows.",
+    // --- Unified service fields (aliased across both branches) ---
+    parent_netsuite_id: "The internal demo_platform ID of the customer record that owns this service. Used as the join key between the customer and service tables in the raw source.",
+    service_id: "Unified alias for the service record ID. Sourced from membership_service_id (membership branch) or website_service_id (digital branch).",
+    service_status_id: "Numeric ID of the service status. Unified alias for membership_service_status_id or website_service_status_id.",
+    service_status: "Human-readable service status (e.g., 'Active', 'Terminated'). Unified alias for membership_service_status or website_service_status.",
+    service_start_date: "Date the service was first started. Unified alias for membership_service_start_date or website_service_start_date.",
+    service_end_date: "Date the service ended or was terminated. Unified alias for membership_service_end_date or website_service_end_date. NULL if service is still active.",
+    is_inactive_service: "True if the service record has been marked inactive in demo_platform. Unified alias across both branches.",
+    termination_reason_id: "Numeric ID of the termination reason. Populated only when the service was terminated.",
+    termination_reason_description: "Human-readable description of why the service was terminated.",
+    termination_notes: "Free-text notes entered at time of termination.",
+    termination_group: "Controllability classification of the termination reason. Values: 'Controllable' or 'Uncontrollable'.",
+    // --- Membership-only service fields (NULL for digital rows) ---
+    membership_division_id: "Numeric ID of the demo division associated with the membership service. NULL for digital rows.",
+    membership_division_name: "Name of the demo division associated with the membership service (e.g., 'RWS', 'NECO'). NULL for digital rows.",
+    membership_region_id: "Numeric ID of the demo region associated with the membership service. NULL for digital rows.",
+    membership_region_name: "Name of the demo region associated with the membership service (e.g., 'INDY', 'NECO'). NULL for digital rows.",
+    // --- Unified subscription fields (aliased across all 4 subscription types) ---
+    subscription_id: "Unified alias for the subscription record ID. Sourced from membership_subscription_id, web_service_subscription_id, digital_marketing_subscription_id, or website_subscription_id depending on opportunity_type.",
+    parent_service_id: "The service record ID that owns this subscription. Links back to service_id. Unified alias for parent_membership_service_id or parent_website_service_id.",
+    subscription_name_id: "Numeric ID of the subscription product/item. Unified alias across all subscription types.",
+    subscription_name: "Display name of the subscription product (e.g., 'RetailDeck', 'AdRocket'). Sourced from the item table. Unified alias across all subscription types.",
+    subscription_status: "Status of the subscription record (e.g., 'Active', 'Terminated'). Unified alias across all subscription types.",
+    subscription_start_date: "Date the subscription became active. Unified alias across all subscription types.",
+    subscription_end_date: "Date the subscription ended. NULL if still active. Unified alias across all subscription types.",
+    subscription_price: "Billed price for the subscription in decimal format. Unified alias across all subscription types.",
+    is_inactive_subscription: "True if the subscription record has been marked inactive in demo_platform. Unified alias across all subscription types.",
+    // --- Membership-only subscription fields (NULL for digital rows) ---
+    membership_subscription_status_id: "Numeric ID of the membership subscription status. Only present for opportunity_type = 'membership'. NULL for all digital rows.",
+    // --- Digital-only subscription fields (NULL for membership rows) ---
+    subscription_billing_name: "The billing account name associated with this subscription. NULL for membership rows.",
+    subscription_payment_method_id: "ID of the payment method used for billing. NULL for membership rows.",
+    subscription_payment_method_name: "Human-readable name of the payment method (e.g., 'ACH', 'IAC'). NULL for membership rows.",
+    is_payment_method_billed: "True if the payment method is actively being billed. NULL for membership rows.",
+    opportunity_type: "Classification of the subscription opportunity as defined on the item record (e.g., 'Web Services'). NULL for membership rows.",
+    subscription_billing_start_date: "Date billing began for this subscription. NULL for membership rows.",
+    // --- Website-subscription-only fields (NULL for all other subscription types) ---
+    subscription_billing_end_date: "Date billing ended for this subscription. Only populated for opportunity_type = 'website'. NULL for all other types.",
+    subscription_reverse_rank: "Reverse rank of the website subscription product, used to identify the highest-tier active subscription. Only populated for opportunity_type = 'website'. NULL for all other types.",
+    // --- MISC
+    netsuite_id: "Old internal_netsuite_id field",
+    customer_mattress_status: "This field is a driver for member dues billing that SSB is going to pay",
+    website_service_mattress_status: "This field is an indication of which customer's website is AM."
+  }
+}
+
+
+-- Change Log
+-- 2026-06-11 | Stakeholder | Rebuilt as UNION ALL of membership and digital_service Fbranches; subscription grain; unified field aliases across service and subscription types
+
+WITH
+
+-- =========================================================
+-- Import CTEs
+-- =========================================================
+
+membership_customers AS (
+    SELECT * FROM ${ref("demo_staging_netsuite", "customer")}
+),
+membership_services AS (
+    SELECT * FROM ${ref("demo_staging_netsuite", "customer_membership_services")}
+),
+membership_subscriptions AS (
+    SELECT * FROM ${ref("demo_staging_netsuite", "customer_membership_subscriptions")}
+),
+digital_customers AS (
+    SELECT * FROM ${ref("demo_staging_netsuite", "customer")}
+),
+digital_website_services AS (
+    SELECT * FROM ${ref("demo_staging_netsuite", "customer_website_services")}
+),
+digital_web_service_subscriptions AS (
+    SELECT * FROM ${ref("demo_staging_netsuite", "customer_web_service_subscriptions")}
+),
+digital_marketing_subscriptions AS (
+    SELECT * FROM ${ref("demo_staging_netsuite", "customer_digital_marketing_subscriptions")}
+),
+digital_website_subscriptions AS (
+    SELECT * FROM ${ref("demo_staging_netsuite", "customer_website_subscriptions")}
+),
+
+-- Logical CTEs
+membership AS (
+  SELECT
+    -- discriminators
+    'membership' AS service_category,
+    -- customer fields
+    mc.customer_id,
+    mc.company_name,
+    mc.company_alt_name,
+    mc.previous_demo_id,
+    mc.netsuite_id,
+    mc.customer_id_check,
+    mc.customer_status_id,
+    mc.customer_status,
+    mc.customer_status_type,
+    mc.lrs_customer_type,
+    mc.number_of_employees,
+    mc.last_modified_date,
+    mc.date_created,
+    mc.is_inactive_customer,
+    mc.is_internal_announcement_only,
+    mc.number_of_locations,
+    mc.industry,
+    mc.industry_name,
+    mc.yearly_retail_revenue_bucket,
+    mc.revenue,
+    mc.current_group,
+    mc.new_group,
+    mc.current_pos_provider,
+    mc.ci_level,
+    mc.website_address,
+    mc.address_1,
+    mc.address_2,
+    mc.address_3,
+    mc.city,
+    mc.state,
+    mc.zip_code,
+    mc.country,
+    mc.company_phone,
+    mc.is_direct_debit,
+    mc.quad_name,
+    mc.primary_email,
+    mc.is_do_not_contact,
+    mc.is_linked_member,
+    mc.linked_member_entity_id,
+    mc.recruiter,
+    mc.assist_closer,
+    mc.sales_rep,
+    mc.onboarder,
+    mc.cam,
+    mc.field_rep,
+    mc.designer,
+    mc.recruiter_role,
+    mc.assist_closer_role,
+    mc.sales_rep_role,
+    mc.onboarder_role,
+    mc.cam_role,
+    mc.field_rep_role,
+    mc.designer_role,
+    mc.recruiter_email,
+    mc.assist_closer_email,
+    mc.sales_rep_email,
+    mc.onboarder_email,
+    mc.cam_email,
+    mc.field_rep_email,
+    mc.designer_email,
+    mc.parent_customer_id,
+    mc.customer_region_id,
+    mc.customer_region_name,
+    mc.customer_division_id,
+    mc.customer_division_name,
+    mc.customer_mattress_status,
+    -- digital-only customer fields (null for membership)
+    CAST(NULL AS string) AS digital_customer_id,
+    CAST(NULL AS string) AS rws_crm_id,
+    -- service fields
+    ms.parent_netsuite_id,
+    ms.membership_service_id AS service_id,
+    ms.membership_service_status_id AS service_status_id,
+    ms.membership_service_status AS service_status,
+    ms.membership_service_start_date AS service_start_date,
+    ms.membership_service_end_date AS service_end_date,
+    ms.termination_reason_id,
+    ms.termination_reason_description,
+    ms.termination_notes,
+    ms.termination_group,
+    ms.is_inactive_membership_service AS is_inactive_service,
+    -- membership-only service fields
+    ms.membership_division_id,
+    ms.membership_division_name,
+    ms.membership_region_id,
+    ms.membership_region_name,
+    -- digital-only service fields (null for membership)
+    CAST(NULL AS string) AS website_service_mattress_status,
+    CAST(NULL AS string) AS webfronts_account_id,
+    CAST(NULL AS string) AS buying_group_user_name,
+    NULL AS buying_group_id,
+    CAST(NULL AS string) AS buying_group_name,
+    CAST(NULL AS string) AS company_member_id,
+    CAST(NULL AS BOOL) AS is_vip,
+    CAST(NULL AS string) AS webfronts_user_name,
+    CAST(NULL AS string) AS website_host,
+    CAST(NULL AS string) AS retail_deck_connection,
+    NULL AS ses_domains_linked,
+    NULL AS flashtag_esls,
+    NULL AS flashtags_connected_loctions_webfronts,
+    CAST(NULL AS BOOL) AS is_configured_with_paypal,
+    CAST(NULL AS date) AS go_live_date,
+    CAST(NULL AS BOOL) AS has_google_analytics_4_key,
+    CAST(NULL AS BOOL) AS has_google_analytics_key,
+    CAST(NULL AS string) AS marketing_groups_id,
+    CAST(NULL AS string) AS marketing_group_names,
+    CAST(NULL AS string) AS legacy_mega_id,
+    NULL AS website_platform_id,
+    CAST(NULL AS string) AS website_platform_name,
+    CAST(NULL AS date) AS oneshop_go_live_date,
+    CAST(NULL AS string) AS website_design_state,
+    CAST(NULL AS string) AS website_production_state_id,
+    CAST(NULL AS string) AS website_production_state_name,
+    NULL AS website_design_state_id,
+    CAST(NULL AS string) AS website_design_state_name,
+    NULL AS webfronts_review_state_id,
+    CAST(NULL AS string) AS webfronts_review_state_name,
+    CAST(NULL AS string) AS adrocket_state_id,
+    CAST(NULL AS string) AS adrocket_state_name,
+    -- subscription fields
+    msub.membership_subscription_id AS subscription_id,
+    msub.parent_membership_service_id AS parent_service_id,
+    msub.membership_subscription_name_id AS subscription_name_id,
+    msub.membership_subscription_name AS subscription_name,
+    msub.subscription_status AS subscription_status,
+    msub.membership_subscription_start_date AS subscription_start_date,
+    msub.membership_subscription_end_date AS subscription_end_date,
+    msub.membership_subscription_price AS subscription_price,
+    msub.is_inactive_membership_subscription AS is_inactive_subscription,
+    -- membership-only subscription fields
+    msub.membership_subscription_status_id,
+    -- digital-only subscription fields (null for membership)
+    CAST(NULL AS string) AS subscription_billing_name,
+    CAST(NULL AS string) AS subscription_payment_method_id,
+    CAST(NULL AS string) AS subscription_payment_method_name,
+    CAST(NULL AS BOOL) AS is_payment_method_billed,
+    'Membership' AS opportunity_type,
+    CAST(NULL AS date) AS subscription_billing_start_date,
+    CAST(NULL AS date) AS subscription_billing_end_date,
+    NULL AS subscription_reverse_rank
+  FROM
+    membership_customers mc
+  INNER JOIN membership_services ms
+    ON mc.customer_id = ms.customer_id
+  INNER JOIN membership_subscriptions msub
+    ON ms.customer_id = msub.customer_id
+    AND ms.membership_service_id = msub.parent_membership_service_id
+),
+digital_web_service AS (
+  SELECT
+    -- discriminators
+    'digital_service' AS service_category,
+    -- customer fields
+    dc.customer_id,
+    dc.company_name,
+    dc.company_alt_name,
+    dc.previous_demo_id,
+    dc.netsuite_id,
+    dc.customer_id_check,
+    dc.customer_status_id,
+    dc.customer_status,
+    dc.customer_status_type,
+    dc.lrs_customer_type,
+    dc.number_of_employees,
+    dc.last_modified_date,
+    dc.date_created,
+    dc.is_inactive_customer,
+    dc.is_internal_announcement_only,
+    dc.number_of_locations,
+    dc.industry,
+    dc.industry_name,
+    dc.yearly_retail_revenue_bucket,
+    dc.revenue,
+    dc.current_group,
+    dc.new_group,
+    dc.current_pos_provider,
+    dc.ci_level,
+    dc.website_address,
+    dc.address_1,
+    dc.address_2,
+    dc.address_3,
+    dc.city,
+    dc.state,
+    dc.zip_code,
+    dc.country,
+    dc.company_phone,
+    dc.is_direct_debit,
+    dc.quad_name,
+    dc.primary_email,
+    dc.is_do_not_contact,
+    dc.is_linked_member,
+    dc.linked_member_entity_id,
+    dc.recruiter,
+    dc.assist_closer,
+    dc.sales_rep,
+    dc.onboarder,
+    dc.cam,
+    dc.field_rep,
+    dc.designer,
+    dc.recruiter_role,
+    dc.assist_closer_role,
+    dc.sales_rep_role,
+    dc.onboarder_role,
+    dc.cam_role,
+    dc.field_rep_role,
+    dc.designer_role,
+    dc.recruiter_email,
+    dc.assist_closer_email,
+    dc.sales_rep_email,
+    dc.onboarder_email,
+    dc.cam_email,
+    dc.field_rep_email,
+    dc.designer_email,
+    dc.parent_customer_id,
+    dc.customer_region_id,
+    dc.customer_region_name,
+    dc.customer_division_id,
+    dc.customer_division_name,
+    dc.customer_mattress_status,
+    -- digital-only customer fields
+    dws.digital_customer_id,
+    dws.rws_crm_id,
+    -- service fields
+    dws.parent_netsuite_id,
+    dws.website_service_id AS service_id,
+    dws.website_service_status_id AS service_status_id,
+    dws.website_service_status AS service_status,
+    dws.website_service_start_date AS service_start_date,
+    dws.website_service_end_date AS service_end_date,
+    dws.termination_reason_id,
+    dws.termination_reason_description,
+    dws.termination_notes,
+    dws.termination_group,
+    dws.is_inactive_website_service AS is_inactive_service,
+    -- membership-only service fields (null for digital)
+    NULL AS membership_division_id,
+    CAST(NULL AS string) AS membership_division_name,
+    NULL AS membership_region_id,
+    CAST(NULL AS string) AS membership_region_name,
+    -- digital-only service fields
+    dws.website_service_mattress_status,
+    dws.webfronts_account_id,
+    dws.buying_group_user_name,
+    dws.buying_group_id,
+    dws.buying_group_name,
+    dws.company_member_id,
+    dws.is_vip,
+    dws.webfronts_user_name,
+    dws.website_host,
+    dws.retail_deck_connection,
+    dws.ses_domains_linked,
+    dws.flashtag_esls,
+    dws.flashtags_connected_loctions_webfronts,
+    dws.is_configured_with_paypal,
+    dws.go_live_date,
+    dws.has_google_analytics_4_key,
+    dws.has_google_analytics_key,
+    dws.marketing_groups_id,
+    dws.marketing_group_names,
+    dws.legacy_mega_id,
+    dws.website_platform_id,
+    dws.website_platform_name,
+    dws.oneshop_go_live_date,
+    dws.website_design_state,
+    dws.website_production_state_id,
+    dws.website_production_state_name,
+    dws.website_design_state_id,
+    dws.website_design_state_name,
+    dws.webfronts_review_state_id,
+    dws.webfronts_review_state_name,
+    dws.adrocket_state_id,
+    dws.adrocket_state_name,
+    -- subscription fields
+    dwss.web_service_subscription_id AS subscription_id,
+    dwss.parent_website_service_id AS parent_service_id,
+    dwss.web_service_subscription_name_id AS subscription_name_id,
+    dwss.web_service_subscription_name AS subscription_name,
+    dwss.web_service_subscription_status AS subscription_status,
+    dwss.web_service_subscription_start_date AS subscription_start_date,
+    dwss.web_service_subscription_end_date AS subscription_end_date,
+    dwss.web_service_subscription_price AS subscription_price,
+    dwss.is_inactive_web_service_subscription AS is_inactive_subscription,
+    -- membership-only subscription fields (null for digital)
+    NULL AS membership_subscription_status_id,
+    -- digital-only subscription fields
+    dwss.web_service_subscription_billing_name AS subscription_billing_name,
+    dwss.web_service_subscription_payment_method_id AS subscription_payment_method_id,
+    dwss.web_service_subscription_payment_method_name AS subscription_payment_method_name,
+    dwss.is_payment_method_billed,
+    dwss.opportunity_type,
+    dwss.web_service_subscription_billing_start_date AS subscription_billing_start_date,
+    CAST(NULL AS date) AS subscription_billing_end_date,
+    NULL AS subscription_reverse_rank
+  FROM
+    digital_customers dc
+  INNER JOIN digital_website_services dws
+    ON dc.customer_id = dws.customer_id
+  INNER JOIN digital_web_service_subscriptions dwss
+    ON dws.customer_id = dwss.customer_id
+    AND dws.website_service_id = dwss.parent_website_service_id
+),
+digital_digital_marketing AS (
+  SELECT
+    -- discriminators
+    'digital_service' AS service_category,
+    -- customer fields
+    dc.customer_id,
+    dc.company_name,
+    dc.company_alt_name,
+    dc.previous_demo_id,
+    dc.netsuite_id,
+    dc.customer_id_check,
+    dc.customer_status_id,
+    dc.customer_status,
+    dc.customer_status_type,
+    dc.lrs_customer_type,
+    dc.number_of_employees,
+    dc.last_modified_date,
+    dc.date_created,
+    dc.is_inactive_customer,
+    dc.is_internal_announcement_only,
+    dc.number_of_locations,
+    dc.industry,
+    dc.industry_name,
+    dc.yearly_retail_revenue_bucket,
+    dc.revenue,
+    dc.current_group,
+    dc.new_group,
+    dc.current_pos_provider,
+    dc.ci_level,
+    dc.website_address,
+    dc.address_1,
+    dc.address_2,
+    dc.address_3,
+    dc.city,
+    dc.state,
+    dc.zip_code,
+    dc.country,
+    dc.company_phone,
+    dc.is_direct_debit,
+    dc.quad_name,
+    dc.primary_email,
+    dc.is_do_not_contact,
+    dc.is_linked_member,
+    dc.linked_member_entity_id,
+    dc.recruiter,
+    dc.assist_closer,
+    dc.sales_rep,
+    dc.onboarder,
+    dc.cam,
+    dc.field_rep,
+    dc.designer,
+    dc.recruiter_role,
+    dc.assist_closer_role,
+    dc.sales_rep_role,
+    dc.onboarder_role,
+    dc.cam_role,
+    dc.field_rep_role,
+    dc.designer_role,
+    dc.recruiter_email,
+    dc.assist_closer_email,
+    dc.sales_rep_email,
+    dc.onboarder_email,
+    dc.cam_email,
+    dc.field_rep_email,
+    dc.designer_email,
+    dc.parent_customer_id,
+    dc.customer_region_id,
+    dc.customer_region_name,
+    dc.customer_division_id,
+    dc.customer_division_name,
+    dc.customer_mattress_status,
+    -- digital-only customer fields
+    dws.digital_customer_id,
+    dws.rws_crm_id,
+    -- service fields
+    dws.parent_netsuite_id,
+    dws.website_service_id AS service_id,
+    dws.website_service_status_id AS service_status_id,
+    dws.website_service_status AS service_status,
+    dws.website_service_start_date AS service_start_date,
+    dws.website_service_end_date AS service_end_date,
+    dws.termination_reason_id,
+    dws.termination_reason_description,
+    dws.termination_notes,
+    dws.termination_group,
+    dws.is_inactive_website_service AS is_inactive_service,
+    -- membership-only service fields (null for digital)
+    NULL AS membership_division_id,
+    CAST(NULL AS string) AS membership_division_name,
+    NULL AS membership_region_id,
+    CAST(NULL AS string) AS membership_region_name,
+    -- digital-only service fields
+    dws.website_service_mattress_status,
+    dws.webfronts_account_id,
+    dws.buying_group_user_name,
+    dws.buying_group_id,
+    dws.buying_group_name,
+    dws.company_member_id,
+    dws.is_vip,
+    dws.webfronts_user_name,
+    dws.website_host,
+    dws.retail_deck_connection,
+    dws.ses_domains_linked,
+    dws.flashtag_esls,
+    dws.flashtags_connected_loctions_webfronts,
+    dws.is_configured_with_paypal,
+    dws.go_live_date,
+    dws.has_google_analytics_4_key,
+    dws.has_google_analytics_key,
+    dws.marketing_groups_id,
+    dws.marketing_group_names,
+    dws.legacy_mega_id,
+    dws.website_platform_id,
+    dws.website_platform_name,
+    dws.oneshop_go_live_date,
+    dws.website_design_state,
+    dws.website_production_state_id,
+    dws.website_production_state_name,
+    dws.website_design_state_id,
+    dws.website_design_state_name,
+    dws.webfronts_review_state_id,
+    dws.webfronts_review_state_name,
+    dws.adrocket_state_id,
+    dws.adrocket_state_name,
+    -- subscription fields
+    dms.digital_marketing_subscription_id AS subscription_id,
+    dms.parent_website_service_id AS parent_service_id,
+    dms.digital_marketing_subscription_name_id AS subscription_name_id,
+    dms.digital_marketing_subscription_name AS subscription_name,
+    dms.digital_marketing_subscription_status AS subscription_status,
+    dms.digital_marketing_subscription_start_date AS subscription_start_date,
+    dms.digital_marketing_subscription_end_date AS subscription_end_date,
+    dms.digital_marketing_subscription_price AS subscription_price,
+    dms.is_inactive_digital_marketing_subscription AS is_inactive_subscription,
+    -- membership-only subscription fields (null for digital)
+    NULL AS membership_subscription_status_id,
+    -- digital-only subscription fields
+    dms.digital_marketing_subscription_billing_name AS subscription_billing_name,
+    CAST(
+      dms.digital_marketing_subscription_payment_method_id AS string
+    ) AS subscription_payment_method_id,
+    dms.digital_marketing_subscription_payment_method_name AS subscription_payment_method_name,
+    dms.is_payment_method_billed,
+    dms.opportunity_type,
+    dms.digital_marketing_billing_start_date AS subscription_billing_start_date,
+    CAST(NULL AS date) AS subscription_billing_end_date,
+    NULL AS subscription_reverse_rank
+  FROM
+    digital_customers dc
+  INNER JOIN digital_website_services dws
+    ON dc.customer_id = dws.customer_id
+  INNER JOIN digital_marketing_subscriptions dms
+    ON dws.customer_id = dms.customer_id
+    AND dws.website_service_id = dms.parent_website_service_id
+),
+digital_website AS (
+  SELECT
+    -- discriminators
+    'digital_service' AS service_category,
+    -- customer fields
+    dc.customer_id,
+    dc.company_name,
+    dc.company_alt_name,
+    dc.previous_demo_id,
+    dc.netsuite_id,
+    dc.customer_id_check,
+    dc.customer_status_id,
+    dc.customer_status,
+    dc.customer_status_type,
+    dc.lrs_customer_type,
+    dc.number_of_employees,
+    dc.last_modified_date,
+    dc.date_created,
+    dc.is_inactive_customer,
+    dc.is_internal_announcement_only,
+    dc.number_of_locations,
+    dc.industry,
+    dc.industry_name,
+    dc.yearly_retail_revenue_bucket,
+    dc.revenue,
+    dc.current_group,
+    dc.new_group,
+    dc.current_pos_provider,
+    dc.ci_level,
+    dc.website_address,
+    dc.address_1,
+    dc.address_2,
+    dc.address_3,
+    dc.city,
+    dc.state,
+    dc.zip_code,
+    dc.country,
+    dc.company_phone,
+    dc.is_direct_debit,
+    dc.quad_name,
+    dc.primary_email,
+    dc.is_do_not_contact,
+    dc.is_linked_member,
+    dc.linked_member_entity_id,
+    dc.recruiter,
+    dc.assist_closer,
+    dc.sales_rep,
+    dc.onboarder,
+    dc.cam,
+    dc.field_rep,
+    dc.designer,
+    dc.recruiter_role,
+    dc.assist_closer_role,
+    dc.sales_rep_role,
+    dc.onboarder_role,
+    dc.cam_role,
+    dc.field_rep_role,
+    dc.designer_role,
+    dc.recruiter_email,
+    dc.assist_closer_email,
+    dc.sales_rep_email,
+    dc.onboarder_email,
+    dc.cam_email,
+    dc.field_rep_email,
+    dc.designer_email,
+    dc.parent_customer_id,
+    dc.customer_region_id,
+    dc.customer_region_name,
+    dc.customer_division_id,
+    dc.customer_division_name,
+    dc.customer_mattress_status,
+    -- digital-only customer fields
+    dws.digital_customer_id,
+    dws.rws_crm_id,
+    -- service fields
+    dws.parent_netsuite_id,
+    dws.website_service_id AS service_id,
+    dws.website_service_status_id AS service_status_id,
+    dws.website_service_status AS service_status,
+    dws.website_service_start_date AS service_start_date,
+    dws.website_service_end_date AS service_end_date,
+    dws.termination_reason_id,
+    dws.termination_reason_description,
+    dws.termination_notes,
+    dws.termination_group,
+    dws.is_inactive_website_service AS is_inactive_service,
+    -- membership-only service fields (null for digital)
+    NULL AS membership_division_id,
+    CAST(NULL AS string) AS membership_division_name,
+    NULL AS membership_region_id,
+    CAST(NULL AS string) AS membership_region_name,
+    -- digital-only service fields
+    dws.website_service_mattress_status,
+    dws.webfronts_account_id,
+    dws.buying_group_user_name,
+    dws.buying_group_id,
+    dws.buying_group_name,
+    dws.company_member_id,
+    dws.is_vip,
+    dws.webfronts_user_name,
+    dws.website_host,
+    dws.retail_deck_connection,
+    dws.ses_domains_linked,
+    dws.flashtag_esls,
+    dws.flashtags_connected_loctions_webfronts,
+    dws.is_configured_with_paypal,
+    dws.go_live_date,
+    dws.has_google_analytics_4_key,
+    dws.has_google_analytics_key,
+    dws.marketing_groups_id,
+    dws.marketing_group_names,
+    dws.legacy_mega_id,
+    dws.website_platform_id,
+    dws.website_platform_name,
+    dws.oneshop_go_live_date,
+    dws.website_design_state,
+    dws.website_production_state_id,
+    dws.website_production_state_name,
+    dws.website_design_state_id,
+    dws.website_design_state_name,
+    dws.webfronts_review_state_id,
+    dws.webfronts_review_state_name,
+    dws.adrocket_state_id,
+    dws.adrocket_state_name,
+    -- subscription fields
+    dsub.website_subscription_id AS subscription_id,
+    dsub.parent_website_service_id AS parent_service_id,
+    dsub.website_subscription_name_id AS subscription_name_id,
+    dsub.website_subscription_name AS subscription_name,
+    dsub.website_subscription_status AS subscription_status,
+    dsub.website_subscription_start_date AS subscription_start_date,
+    dsub.website_subscription_end_date AS subscription_end_date,
+    dsub.website_subscription_price AS subscription_price,
+    dsub.is_inactive_website_subscription AS is_inactive_subscription,
+    -- membership-only subscription fields (null for digital)
+    NULL AS membership_subscription_status_id,
+    -- digital-only subscription fields
+    dsub.website_subscription_billing_name AS subscription_billing_name,
+    CAST(
+      dsub.website_subscription_payment_method_id AS string
+    ) AS subscription_payment_method_id,
+    dsub.website_subscription_payment_method_name AS subscription_payment_method_name,
+    dsub.is_payment_method_billed,
+    dsub.opportunity_type,
+    dsub.website_subscription_billing_start_date AS subscription_billing_start_date,
+    dsub.website_subscription_billing_end_date AS subscription_billing_end_date,
+    dsub.website_subscription_reverse_rank AS subscription_reverse_rank
+  FROM
+    digital_customers dc
+  INNER JOIN digital_website_services dws
+    ON dc.customer_id = dws.customer_id
+  INNER JOIN digital_website_subscriptions dsub
+    ON dws.customer_id = dsub.customer_id
+    AND dws.website_service_id = dsub.parent_website_service_id
+),
+digital AS (
+  SELECT * FROM digital_web_service
+  UNION ALL
+  SELECT * FROM digital_digital_marketing
+  UNION ALL
+  SELECT * FROM digital_website
+),
+final AS (
+  SELECT * FROM membership
+  UNION ALL
+  SELECT * FROM digital
+)
+SELECT
+  *
+FROM
+  final

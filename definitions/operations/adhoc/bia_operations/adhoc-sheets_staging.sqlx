@@ -1,0 +1,60 @@
+config {
+  type: "operations",
+  name: "sheets_staging_update",
+  schema: "bia_operations",
+  tags: ["bia_op 1 hour"]
+}
+
+
+-- Declare variables for dynamic SQL and column filtering
+DECLARE v_sql STRING;
+DECLARE v_column_filter STRING;
+BEGIN
+  -- Loop through all tables in the sheets dataset
+
+  create table if not exists `demo-project.sheets_staging.sheets_staging_errors` (
+    table_name string,
+    error_message string,
+    error_time timestamp
+  );
+
+  FOR record IN (
+    SELECT table_name
+    FROM `sheets.INFORMATION_SCHEMA.TABLES`
+    -- below filters google sheets with insufficient privileges
+    WHERE table_name NOT IN ('doc_cleanup', 'product_finder') 
+    ORDER BY table_name
+  ) DO
+    BEGIN
+      -- Build dynamic OR condition to filter out rows where all columns are null
+      SET v_column_filter = (
+        SELECT STRING_AGG(
+                 FORMAT('`%s` IS NOT NULL', column_name),
+                 ' OR '
+               )
+        FROM `demo-project.sheets.INFORMATION_SCHEMA.COLUMNS`
+        WHERE table_name = record.table_name
+      );
+
+      -- Create dynamic SQL to copy each table from sheets to sheets_staging, excluding all-null rows
+      SET v_sql = FORMAT(
+        'CREATE OR REPLACE TABLE `demo-project.sheets_staging.%s` AS SELECT * FROM `demo-project.sheets.%s` WHERE %s;',
+        record.table_name,
+        record.table_name,
+        v_column_filter
+      );
+
+      -- Execute the dynamic SQL statement
+      EXECUTE IMMEDIATE v_sql;
+    -- Handle any errors during table creation and continue with next table
+    EXCEPTION WHEN ERROR THEN
+      insert into `demo-project.sheets_staging.sheets_staging_errors` values (
+        record.table_name,
+        @@error.message,
+        current_timestamp()
+      );
+    --   SELECT FORMAT('Failed to create table %s: %t', record.table_name, @@error.message);
+      CONTINUE;
+    END;
+  END FOR;
+END;

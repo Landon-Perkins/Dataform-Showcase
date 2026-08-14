@@ -1,0 +1,150 @@
+config {
+  type: "assertion",
+  tags: ["independent assertion 1 hour"]
+}
+-- Purpose: If a source table (demo_sources, demo_platform,...) has not been updated within a specific timedframe
+--         an error is flagged. Further investigation into rootcause is necessary.
+-- 
+
+WITH 
+  d_w_25 AS(
+    SELECT
+      dataset_id||'.'||table_id AS TABLE,
+      DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York') AS last_modified_date_est,
+      DATETIME_DIFF(CURRENT_DATETIME('America/New_York'),DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York'),HOUR) AS hour_since_modified
+    FROM
+      `demo-project.demo_sources.__TABLES__`
+    WHERE
+      table_id IN ('rebate_programs')
+      AND type = 1
+      AND DATETIME_DIFF(
+        CURRENT_DATETIME('America/New_York'),
+        DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York'),
+        HOUR
+        ) > 25),
+  members AS(
+    SELECT
+      dataset_id||'.'||table_id AS TABLE,
+      DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York') AS last_modified_date_est,
+      DATETIME_DIFF(CURRENT_DATETIME('America/New_York'),DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York'),HOUR) AS hour_since_modified
+    FROM
+      `demo-project.demo_sources.__TABLES__`
+    WHERE
+      table_id IN ('members', 'netsuite_membership')
+      AND type = 1
+      AND DATETIME_DIFF(
+        CURRENT_DATETIME('America/New_York'),
+        DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York'),
+        HOUR
+        ) > 12),
+  member_snapshots AS(
+    SELECT
+      dataset_id||'.'||table_id AS TABLE,
+      DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York') AS last_modified_date_est,
+      DATETIME_DIFF(CURRENT_DATETIME('America/New_York'),DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York'),HOUR) AS hour_since_modified
+    FROM
+      `demo-project.demo_sources.__TABLES__`
+    WHERE
+      table_id = 'member_snapshots'
+      AND type = 1
+      AND DATETIME_DIFF(
+        CURRENT_DATETIME('America/New_York'),
+        DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York'),
+        HOUR
+        ) > 100),
+  swoogo AS(
+  -- if theres no new data to ingest the bq table wont show an updated value. 
+  -- Essentialy Datastream runs a merge process every 15 minutes, and 
+  -- the swoogo cronjob runs daily at 5 am.
+    SELECT
+      dataset_id||'.'||table_id AS TABLE,
+      DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York') AS last_modified_date_est,
+      DATETIME_DIFF(CURRENT_DATETIME('America/New_York'),DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York'),HOUR) AS hour_since_modified
+    FROM
+      `demo-project.swoogo.__TABLES__`
+    WHERE
+      table_id = 'loaders_swoogo_contacts'
+      AND type = 1
+      AND DATETIME_DIFF(
+        CURRENT_DATETIME('America/New_York'),
+        DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York'),
+        HOUR
+        ) > 49
+  ),
+  sheets_staging AS(
+    -- Checks all tables within the sheets_staging dataset. Should not be more than 1 hour stale
+    SELECT
+      dataset_id||'.'||table_id AS TABLE,
+      DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York') AS last_modified_date_est,
+      DATETIME_DIFF(CURRENT_DATETIME('America/New_York'),DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York'),HOUR) AS hour_since_modified
+    FROM
+      `demo-project.sheets_staging.__TABLES__`
+    WHERE
+      type = 1
+      AND DATETIME_DIFF(CURRENT_DATETIME('America/New_York'), DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York'),HOUR) > 2
+      and table_id != 'sheets_staging_errors'
+  ),
+  mso_raw_and_imports AS(
+    SELECT
+      dataset_id||'.'||table_id AS TABLE,
+      DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York') AS last_modified_date_est,
+      DATETIME_DIFF(CURRENT_DATETIME('America/New_York'),DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York'),HOUR) AS hour_since_modified
+    FROM
+      `demo-project.demo_sources.__TABLES__`
+    WHERE
+      table_id IN ('member_sale_outs_raw', 'member_sale_outs_imports')
+      AND type = 1
+      AND DATETIME_DIFF(
+        CURRENT_DATETIME('America/New_York'),
+        DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York'),
+        HOUR
+        ) > 3
+  ),
+  sell_in_raw AS(
+    SELECT
+      dataset_id||'.'||table_id AS TABLE,
+      DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York') AS last_modified_date_est,
+      DATETIME_DIFF(CURRENT_DATETIME('America/New_York'),DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York'),HOUR) AS hour_since_modified
+    FROM
+      `demo-project.demo_sources.__TABLES__`
+    WHERE
+      table_id IN ('member_sales_raw')
+      AND type = 1
+      AND DATETIME_DIFF(
+        CURRENT_DATETIME('America/New_York'),
+        DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York'),
+        HOUR
+        ) > 5
+  ),
+  sku_match AS(
+    SELECT
+      dataset_id||'.'||table_id AS TABLE,
+      DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York') AS last_modified_date_est,
+      DATETIME_DIFF(CURRENT_DATETIME('America/New_York'),DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York'),HOUR) AS hour_since_modified
+    FROM
+      `demo-project.product_sku_match.__TABLES__`
+    WHERE
+      table_id = 'pos_algo_v2_final_load'
+      AND type = 1
+      AND DATETIME_DIFF(
+        CURRENT_DATETIME('America/New_York'),
+        DATETIME(TIMESTAMP_MILLIS(last_modified_time),'America/New_York'),
+        HOUR
+        ) > 24
+  )
+
+SELECT * FROM d_w_25
+UNION ALL
+SELECT * FROM members
+UNION ALL
+SELECT * FROM member_snapshots
+UNION ALL
+SELECT * FROM swoogo
+UNION ALL
+SELECT * FROM sheets_staging
+UNION ALL
+SELECT * FROM mso_raw_and_imports
+UNION ALL
+SELECT * FROM sku_match
+UNION ALL
+SELECT * FROM sell_in_raw

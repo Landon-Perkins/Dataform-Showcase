@@ -1,0 +1,195 @@
+config {
+  type: "table",
+  name: "rebates",
+  schema: "demo_reporting",
+  description: "Reporting layer for rebate performance, claim outcomes, and program attribution across customers and products.",
+  bigquery: {
+    labels: {
+      scheduler: "dataform",
+      frequency: "daily"
+    }
+  },
+  tags: ["reporting",
+    "rebates",
+    "p_bi daily"
+  ],
+  dependOnDependencyAssertions: true,
+  assertions: {
+    //nonNull: "demo_id"
+    //rowConditions:["demo_id IS NOT NULL"]
+  },
+}
+
+
+-- Change log
+-- 2023-11-15 | Stakeholder | Added product_labels to serve the purpose of seeing the number of products and rebate labels
+-- 2023-11-28 | Stakeholder | Added vendor_name from vendors. Joined s_o_t.vendors
+-- 2025-12-08 | Stakeholder | demo_platform Vendor rework.
+-- 2026-03-01 | Stakeholder | Rewkork of holiday event handling to break depedency on rebate google sheet.
+-- 2026-03-23 | Stakeholder | dropped member and date fields - deprecated and dropped @Stakeholder request (no longer needed in PBI)
+
+WITH
+customer AS (
+  SELECT
+    customer.id,
+    customer.altname,
+    mn_vendor_id
+  FROM `demo-project.netsuite_suiteanalytics.customer` customer
+  LEFT JOIN `demo-project.netsuite_suiteanalytics.customersubsidiaryrelationship` csr
+    ON customer.id = csr.entity
+  LEFT JOIN UNNEST(SPLIT(customer.custentity_activenet_id, '-')) AS mn_vendor_id
+  WHERE
+    custentity_lrs_customer_type = 4
+    AND customer._fivetran_deleted = FALSE
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY id, mn_vendor_id
+    ORDER BY csr.subsidiary
+  ) = 1
+),
+
+base_rebates AS (
+  SELECT
+    DATE_TRUNC(r.rebate_created_date, MONTH) AS t_date,
+    -- FORMAT_DATE('%Y%m', r.paid_date) AS yyyymm,
+    -- EXTRACT(YEAR FROM r.rebate_created_date) AS year,
+    -- EXTRACT(MONTH FROM r.rebate_created_date) AS month,
+    -- EXTRACT(QUARTER FROM r.rebate_created_date) AS quarter,
+    r.product_key,
+    r.transaction_id,
+    r.demo_id,
+    r.rebate_created_date,
+    r.sale_date,
+    r.delivery_date,
+    -- r.customer_first_name,
+    -- r.customer_last_name,
+    -- r.customer_name,
+    r.invoice_number,
+    r.claim_amount,
+    r.rebate_status,
+    r.decline_reason,
+    r.program_type,
+    r.program_code,
+    r.bonus_program_name,
+    r.is_bonus,
+    r.bonus_transaction_id,
+    COALESCE(r.quantity, 0) AS quantity,
+    -- r.customer_email,
+    r.paid_date,
+    r.approved_date,
+    r.sell_price,
+    r.submission_method,
+    r.affiliate_demo_id,
+    r.location,
+    r.insights_dealer_id,
+    r.insights_brand,
+    r.insights_pn,
+    r.insights_serial_number,
+    r.batch_id,
+    r.program_name,
+    r.rebate_type,
+    r.program_start_date,
+    r.program_end_date,
+    r.item_claim,
+    r.demo_program,
+    -- m.preferred_name AS member_name,
+    -- m.division_id,
+    m.is_brand_builder,
+    -- m.division_name,
+    -- m.division_field_rep_id,
+    -- IF(m.is_deleted = TRUE, 'Terminated', 'Active') AS member_status,
+    -- m.msm,
+    -- m.region,
+    b.brand_code,
+    b.brand_name,
+    b.parent_brand_name,--Stakeholder edit 12/29/2022
+    c2. id as reporting_parent_brand_id, --Stakeholder edit 12/29/2022	b.country_of_origin,
+    b.category_value,
+    b.sub_category_value,
+    -- b.reporting_brand_id AS vendor_id,
+    c1.id as vendor_id,
+    b.vendor_alias,
+    v.name AS vendor_name, -- 2023-11-28 | Stakeholder
+    b.is_luxury,
+    b.is_showcase,
+    IF(r.claim_amount > 0, p.pn, NULL) AS pn,
+    IF(r.claim_amount > 0, p.super_class_code, NULL) AS super_class_code,
+    -- IF(r.claim_amount > 0, p.super_class_description, NULL) AS super_class_description,
+    -- IF(r.claim_amount > 0, p.major_class_code, NULL) AS major_class_code,
+    -- IF(r.claim_amount > 0, p.major_class_description, NULL) AS major_class_description,
+    -- IF(r.claim_amount > 0, p.minor_class_code, NULL) AS minor_class_code,
+    -- IF(r.claim_amount > 0, p.minor_class_description, NULL) AS minor_class_description,
+    p.showcase_major_category,
+    p.showcase_sub_category,
+    p.showcase_major_class,
+    p.showcase_minor_class,
+    p.t5_t6,
+    r.holiday_event,
+    r.holiday_p_code,
+    r.holiday_p_name,
+    r.holiday_vertical,
+    r.holiday_priority_rank,
+    -- r.vendor_id
+    -- r.holiday_event_priority, -- Stakeholder - added 23-01-06
+    CASE
+      WHEN r.demo_program = TRUE THEN FALSE
+      WHEN r.demo_program = FALSE THEN TRUE
+      ELSE NULL
+      END AS holiday_member_related,
+    IF(r.demo_program = TRUE AND LOWER(r.rebate_status) != 'declined', TRUE, FALSE) AS is_demo_and_not_declined
+  FROM ${ref("demo_staging", "rebates")} AS r
+  LEFT JOIN ${ref("demo_staging", "members")} AS m
+    ON r.demo_id = m.demo_id
+  LEFT JOIN ${ref("demo_staging", "products")} AS p
+    ON r.product_key = p.key
+  LEFT JOIN ${ref("demo_staging", "brands")} AS b
+    ON p.brand_code = b.brand_code
+  LEFT JOIN ${ref("demo_staging", "vendors")} AS v -- 2023-11-28 | Stakeholder
+    ON b.reporting_brand_id = v.id
+  left join customer c1
+    on b.reporting_brand_id = safe_cast(c1.mn_vendor_id as int)
+  left join customer c2
+    on b.reporting_parent_brand_id = safe_cast(c2.mn_vendor_id as int)
+),
+
+products_labels AS (
+  -- 2023-11-15 | Stakeholder
+  -- Added product_labels to serve the purpose of seeing the number of products and rebate labels
+  SELECT
+    program_name,
+    program_code,
+    invoice_number,
+    COALESCE(batch_id, 9999) AS batch_id,--Stakeholder edit 1/12/2024
+    -- customer_name,
+    -- customer_email,
+    SUM(quantity) AS number_of_products,
+    CONCAT('Package: ', SUM(quantity), IF(SUM(quantity) > 1, ' products', ' product')) AS rebate_label
+  FROM base_rebates
+  WHERE
+    -- item_claim != 0 -- 2026-03-09 | Stakeholder
+    claim_amount != 0
+    -- AND LOWER(rebate_status) in ("paid","approved") -- !!!! OR you could use ="paid" ( WITH different results) !!!!
+    AND UPPER(COALESCE(rebate_status, '')) != 'DECLINED'
+    AND brand_code IS NOT NULL
+  GROUP BY
+    program_name,
+    program_code,
+    batch_id,
+    -- customer_name,
+    -- customer_email,
+    invoice_number
+  ORDER BY number_of_products DESC
+)
+
+SELECT
+  br.*,
+  pl.number_of_products,
+  pl.rebate_label
+FROM base_rebates AS br
+LEFT JOIN products_labels AS pl
+  ON
+    br.program_name = pl.program_name
+    AND br.program_code = pl.program_code
+    AND br.invoice_number = pl.invoice_number
+    AND pl.batch_id = COALESCE(br.batch_id, 9999)
+    -- AND br.customer_name = pl.customer_name
+    -- AND br.customer_email = pl.customer_email

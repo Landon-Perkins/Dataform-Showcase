@@ -1,0 +1,101 @@
+config {
+  type: "assertion",
+  tags: [
+    "data_quality",
+    "independent assertion 1 hour",
+  ],
+  description: "Checks for >10% variance in row counts by comparing current state to morning baseline snapshot"
+}
+
+-- Requirements:  This assertion relies on a baseline snapshot of row counts captured each morning by the 
+--                adhoc-demo_staging_historical_row_counts operation. The assertion compares current row counts 
+--                from BigQuery metadata to the baseline and flags any tables with >10% variance 
+--                (ignoring tables that were empty at baseline).
+
+-- Change Log
+-- 2026-02-16 | Stakeholder | Created assertion to monitor row count variance across demo_staging tables
+-- 2026-02-16 | Stakeholder | Simplified to use morning baseline instead of time travel
+-- 2026-03-27 | Stakeholder | Exclude already-logged variances; keyed on current_count so re-fires if count changes further
+-- 2026-03-31 | Stakeholder | Re-keyed already_logged on (table_name, current_count, log date) to suppress same-day re-alerts
+--                       across daily baseline refreshes
+
+
+WITH
+-- Get current row counts from BigQuery metadata (no actual table scan)
+current_counts AS (
+  SELECT
+    table_id AS table_name,
+    row_count AS current_count
+  FROM `demo-project.netsuite_suiteanalytics.__TABLES__`
+  WHERE LOWER(table_id) NOT LIKE 'vw_%'
+),
+
+-- Get baseline counts from operation-created table (captured this morning)
+baseline_counts AS (
+  SELECT
+    table_name,
+    baseline_count,
+    baseline_captured_at
+  FROM `demo-project.dataform_assertions.netsuite_baseline_row_counts`
+  WHERE baseline_captured_at = (
+    SELECT MAX(baseline_captured_at)
+    FROM `demo-project.dataform_assertions.netsuite_baseline_row_counts`
+  )
+),
+
+table_counts AS (
+  SELECT
+    c.table_name,
+    c.current_count,
+    b.baseline_count,
+    b.baseline_captured_at
+  FROM current_counts AS c
+  INNER JOIN baseline_counts AS b
+    ON c.table_name = b.table_name
+),
+
+variance_calculations AS (
+  SELECT
+    table_name,
+    current_count,
+    baseline_count,
+    baseline_captured_at,
+    current_count - baseline_count AS count_diff,
+    SAFE_DIVIDE(
+      ABS(current_count - baseline_count),
+      NULLIF(baseline_count, 0)
+    ) AS variance_pct
+  FROM table_counts
+),
+
+-- Variances already captured in the log today; keyed on (table_name, current_count, log date).
+-- Suppresses re-alerts within the same day even if a new baseline is captured.
+-- Re-fires if current_count changes (count_diff shifts further).
+already_logged AS (
+  SELECT DISTINCT
+    table_name,
+    current_count,
+    DATE(capture_datetime_us_east) AS log_date
+  FROM `demo-project.dataform_assertions.netsuite_row_count_variance_log`
+),
+
+final AS (
+  SELECT DISTINCT
+    v.table_name,
+    v.current_count,
+    v.baseline_count,
+    v.count_diff,
+    ROUND(v.variance_pct * 100, 2) AS variance_percentage,
+    v.baseline_captured_at
+  FROM variance_calculations AS v
+  LEFT JOIN already_logged AS al
+    ON v.table_name = al.table_name
+    AND v.current_count = al.current_count
+    AND al.log_date = CURRENT_DATE('America/New_York')
+  WHERE
+    v.variance_pct > 0.10  -- Flag if variance exceeds 10%
+    AND v.baseline_count > 0  -- Ignore tables that were empty at baseline
+    AND al.table_name IS NULL  -- Skip if already logged today with this exact count
+)
+
+SELECT * FROM final

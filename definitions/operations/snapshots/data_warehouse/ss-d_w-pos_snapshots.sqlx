@@ -1,0 +1,25 @@
+config { type: "incremental",
+         name: "pos_snapshots",
+         schema: "demo_sources",
+         description: "Snapshot of source POS activity used to track historical volume and support operational validation.",
+         bigquery: {
+          labels: {
+            scheduler: "dataform"
+          }
+        },
+         tags: [//"snapshots daily",
+            "snapshot"],
+         protected: true
+        }
+
+SELECT
+  demo_id,
+  file,
+  MIN(date) AS min_date,
+  MAX(date) AS max_date,
+  COUNT(id) AS number_of_rows,
+  SUM(price) AS pos_volume,
+  SUM(units) AS pos_units,
+  CURRENT_DATETIME("America/New_York") AS snapshot_timestamp_est
+FROM ${ref("demo_sources", "member_sale_outs")}
+GROUP BY demo_id, file

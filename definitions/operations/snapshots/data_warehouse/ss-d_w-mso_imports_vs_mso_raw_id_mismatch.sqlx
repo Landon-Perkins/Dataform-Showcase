@@ -1,0 +1,91 @@
+config { type: "incremental",
+         name: "mso_imports_vs_mso_raw_id_mismatch",
+         schema: "demo_sources",
+         description: "Tracks the imports(id) and raw(member_sale_outs_import_id) discrepency between the two table ",
+        bigquery: {
+          labels: {
+            scheduler: "dataform",
+            frequency: "daily"
+          }
+        },
+         tags: ["snapshots daily",
+            "snapshot"],
+         protected: true,
+        columns: {
+          id_count: "Total number of ids that appear in one table vs the comparison table"
+          },         
+        }
+
+WITH 
+  raw_minus_imports AS (
+    SELECT distinct member_sale_outs_import_id FROM  ${ref("demo_sources", "member_sale_outs_raw")} raw
+    EXCEPT DISTINCT
+    SELECT distinct id FROM  ${ref("demo_sources", "member_sale_outs_imports")} im),
+  imports_minus_raw AS (
+    SELECT distinct id FROM  ${ref("demo_sources", "member_sale_outs_imports")} im
+    EXCEPT DISTINCT
+    SELECT distinct member_sale_outs_import_id FROM  ${ref("demo_sources", "member_sale_outs_raw")} raw),
+  imports_totals AS (
+    SELECT 
+      id,
+      demo_id,
+      filename,
+      total_volume,
+      total_units
+    FROM ${ref("demo_sources", "member_sale_outs_imports")} 
+    WHERE id IN (SELECT id FROM imports_minus_raw)),
+  raw_totals AS(
+    SELECT 
+      member_sale_outs_import_id AS id,
+      demo_id,
+      file AS filename,
+      SUM(price) AS total_volume,
+      SUM(units) AS total_units,
+    FROM ${ref("demo_sources", "member_sale_outs_raw")}
+    WHERE member_sale_outs_import_id IN(SELECT member_sale_outs_import_id FROM raw_minus_imports)
+    GROUP BY member_sale_outs_import_id,demo_id,file),
+  totals_union AS (
+    SELECT * FROM imports_totals
+    UNION ALL 
+    SELECT * FROM raw_totals),  
+  raw_ids AS(
+    SELECT 
+    member_sale_outs_import_id AS id, 
+    "Exists in raw but not in imports" AS description,
+    CURRENT_DATE('America/New_York') AS capture_date_us_east
+    FROM raw_minus_imports
+    GROUP BY member_sale_outs_import_id, description,capture_date_us_east),
+  imports_ids AS(
+    SELECT 
+    id, 
+    "Exists in imports but not in raw" AS description,
+    CURRENT_DATETIME('America/New_York') AS capture_date_us_east
+    FROM imports_minus_raw
+    GROUP BY id, description,capture_date_us_east),
+  table_union AS (
+    SELECT * FROM imports_ids
+    UNION ALL 
+    SELECT * FROM raw_ids),
+  count_id AS (
+    SELECT
+      id,
+      description,
+      COUNT(table_union.description) OVER (PARTITION BY table_union.description, table_union.capture_date_us_east) AS id_count,
+      capture_date_us_east
+    FROM table_union),
+  count_totals_join AS (
+    SELECT 
+      count_id.id,
+      count_id.description,
+      count_id.id_count,
+      totals_union.filename,
+      total_volume,
+      total_units,
+      capture_date_us_east
+    FROM count_id
+    LEFT JOIN totals_union
+    USING (id))
+SELECT
+  *
+FROM count_totals_join
+

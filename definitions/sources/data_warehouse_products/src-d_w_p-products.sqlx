@@ -1,0 +1,130 @@
+config {
+  type: "table",
+  name: "products",
+  schema: "demo_sources_products",
+  description: "Products data from DevOps with deleted records restored.",
+  bigquery: {
+    labels: {
+      scheduler: "dataform",
+      frequency: "daily"
+    }
+  },
+  tags: [
+    "products"
+  ],
+  assertions: {
+    uniqueKey: []
+  }
+}
+
+
+
+WITH legacy AS (
+  SELECT
+    NULL AS id, -- new
+    p.key,
+    p.pn,
+    "ACTIVE" AS status, -- new
+    p.brand_code,
+    p.super_class_code,
+    sc.super_class_description, -- not in original, affects demo_staging_products because field gets created later in it
+    p.major_class_code,
+    majc.major_class_description, -- not in original, affects demo_staging_products because description field gets created later in it
+    p.minor_class_code,
+    minc.minor_class_description, -- not in original, affects demo_staging_products because description field gets created later in it
+    p.short_description,
+    p.short_description AS description, -- not in original, affects demo_staging_products because field gets created later in it
+    p.map,
+    p.map_no_promos,
+    p.map_no_promos_end_date,
+    p.map_just_promos,
+    p.map_just_promos_end_date,
+    p.is_energy_star,
+    p.msrp,
+    p.created_date,
+    p.updated_date,
+    p.____row_number,
+    p.upc,
+    p.gtin14,
+    p.ean,
+    p.manufacturer_pn,
+    p.color_code,
+    p.color_code_description,
+    p.sub_brand_code,
+    p.sub_brand_name,
+    p.height,
+    p.width,
+    p.depth,
+    "" AS mattress_size, -- new
+    2 AS priority -- 2 is for legacy products from products.products, 1 is for new products from new database
+  FROM
+    `demo-project.products_archive.products` AS p
+  LEFT JOIN
+    `demo-project.demo_sources.super_classes` AS sc
+    ON p.super_class_code = sc.super_class_code
+  LEFT JOIN
+    `demo-project.demo_sources.major_classes` AS majc
+    ON p.major_class_code = majc.major_class_code
+  LEFT JOIN
+    `demo-project.demo_sources.minor_classes` AS minc
+    ON p.minor_class_code = minc.minor_class_code
+),
+
+new_db AS (
+  SELECT
+    id,
+    key,
+    pn,
+    status,
+    brand_code,
+    super_class_code,
+    super_class_description,
+    major_class_code,
+    major_class_description,
+    minor_class_code,
+    minor_class_description,
+    short_description,
+    description,
+    map,
+    map_no_promos,
+    DATE(map_no_promos_end_date) AS map_no_promos_end_date,
+    map_just_promos,
+    DATE(map_just_promos_end_date) AS map_just_promos_end_date,
+    is_energy_star,
+    msrp,
+    DATE(created_date) AS created_date,
+    DATE(updated_date) AS updated_date,
+    ____row_number,
+    upc_alternate AS upc,
+    gtin14_alternate AS gtin,
+    ean_alternate AS ean,
+    manufacturer_pn,
+    color_code,
+    color_code_description,
+    sub_brand_code,
+    sub_brand_name,
+    height,
+    width,
+    depth,
+    mattress_size,
+    1 AS priority
+  FROM
+    ${ref("demo_sources_products", "products_driver")}
+),
+unioned AS (
+  SELECT * FROM legacy
+  UNION ALL
+  SELECT * FROM new_db
+),
+deduped AS (
+  SELECT 
+    * 
+  FROM unioned QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY key
+    ORDER BY priority
+  ) = 1
+)
+
+SELECT 
+  * 
+FROM deduped

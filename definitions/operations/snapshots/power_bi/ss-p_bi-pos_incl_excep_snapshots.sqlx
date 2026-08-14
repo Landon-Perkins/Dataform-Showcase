@@ -1,0 +1,47 @@
+config {
+    type: "incremental",
+    name: "pos_incl_excep_snapshots",
+    schema: "demo_reporting",
+    bigquery: {
+        labels: {
+            scheduler: "dataform",
+            frequency: "weekly"
+        },
+        partitionBy: "DATETIME_TRUNC(est_timestamp, month)"
+    },
+    tags: [
+        "snapshots weekly"
+    ],
+    protected: true
+}
+
+SELECT
+  date,
+  demo_id,
+  brand_code,
+  brand_name,
+  parent_brand_name,
+  country_of_origin,
+  super_class,
+  showcase_major_category,
+  exception_excluded,
+  exception,
+  SUM(price) AS price,
+  SUM(units) AS units,
+  CURRENT_DATETIME("America/New_York") AS est_timestamp
+FROM
+  `demo-project.demo_reporting.pos_incl_excep`
+WHERE
+  EXTRACT(year FROM date)>=2022
+    --we can figure out how far to go back later
+GROUP BY
+  date,
+  demo_id,
+  brand_code,
+  brand_name,
+  parent_brand_name,
+  country_of_origin,
+  super_class,
+  showcase_major_category,
+  exception_excluded,
+  exception

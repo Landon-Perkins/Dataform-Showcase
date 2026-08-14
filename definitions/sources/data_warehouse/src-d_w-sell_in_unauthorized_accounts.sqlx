@@ -1,0 +1,250 @@
+config {
+    type: "table",
+    schema: "demo_sources",
+    name: "sell_in_unauthorized_accounts",
+    description:"aggregation of all unauthorized accounts for sell-in",
+    tags: ["unauthorized accounts"]
+}
+
+with 
+si_volumes as (
+    select 
+        si.date,
+        si.demo_id,
+        si.vendor_id,
+        si.distributor_id,
+        si.account_number,
+        sum(si.volume) as volume,
+        sid.name,
+        sid.street_address,
+        sid.city,
+        sid.state,
+        sid.zip,
+        sid.email,
+        sid.phone
+    from demo_staging.sell_in si 
+    left join (
+    select * 
+    from demo_sources.sell_in_direct
+        qualify row_number() over (
+            partition by vendor_id, distributor_id, account_number
+            order by name is not null desc 
+            ) = 1
+        ) sid
+        on ifnull(si.vendor_id,1) = ifnull(sid.vendor_id,1)
+        and ifnull(si.distributor_id,1) = ifnull(sid.distributor_id,1)
+        and ifnull(si.account_number,'') = ifnull(sid.account_number,'')
+    group by all
+)
+
+, rc_volumes as (
+    select 
+        invoice_date as date,
+        demo_id,
+        vendor_id,
+        null as distributor_id,
+        merchant_number as account_number,
+        sum(transaction_amt) as volume,
+        member_name as name,
+        cast(null as string) as street_address,
+        cast(null as string) as city,
+        cast(null as string) as state,
+        cast(null as string) as zip,
+        cast(null as string) as email,
+        cast(null as string) as phone 
+    from demo_staging.retail_credit
+    group by all
+)
+
+, lto_volumes as (
+    select 
+        date,
+        demo_id,
+        vendor_id,
+        null as distributor_id,
+        authorized_account_number as account_number,
+        sum(amount) as volume,
+        vendor_retailer_name as name,
+        address_1 || ' ' || address_2 as street_address,
+        city,
+        state,
+        zip,
+        cast(null as string) as email,
+        cast(null as string) as phone 
+    from demo_staging.lease_to_own
+    group by all
+)
+
+, pp_volumes as (
+    select 
+        date,
+        demo_id,
+        vendor_id,
+        null as distributor_id,
+        authorized_account_number as account_number,
+        sum(dealer_cost) as volume,
+        account_name as name,
+        cast(null as string) as street_address,
+        cast(null as string) as city,
+        cast(null as string) as state,
+        cast(null as string) as zip,
+        cast(null as string) as email,
+        cast(null as string) as phone 
+    from demo_staging.product_protection
+    group by all
+)
+
+, ccp_volumes as (
+    select 
+        date,
+        demo_id,
+        vendor_id,
+        null as distributor_id,
+        authorized_account_number as account_number,
+        sum(volume) as volume,
+        vendor_account_name as name,
+        cast(null as string) as street_address,
+        cast(null as string) as city,
+        cast(null as string) as state,
+        cast(null as string) as zip,
+        cast(null as string) as email,
+        cast(null as string) as phone 
+    from demo_staging.credit_card_processing
+    group by all
+)
+
+, if_volumes as (
+    select 
+        date,
+        demo_id,
+        vendor_id,
+        null as distributor_id,
+        authorized_account_number as account_number,
+        sum(eligible_volume) as volume,
+        member_name as name,
+        cast(null as string) as street_address,
+        cast(null as string) as city,
+        cast(null as string) as state,
+        cast(null as string) as zip,
+        cast(null as string) as email,
+        cast(null as string) as phone 
+    from demo_staging.inventory_finance
+    group by all
+)
+
+, synchrony_accounts_add as (
+    select distinct 
+        cast(null as date) as date,
+        null as demo_id,
+        13434 as vendor_id, 
+        null as distributor_id,
+        account_number,
+        0 as volume,
+        name,
+        street_address,
+        city,
+        state,
+        zip,
+        cast(null as string) as email,
+        cast(null as string) as phone 
+    from demo_sources.all_synchrony_accounts asa
+    left join (
+        select 
+            vendor_customer_id,
+            demo_id,
+            authorized_account_number 
+        from demo_staging_netsuite.netsuite_authorized_accounts 
+        where vendor_customer_id = 13434
+    ) naa on asa.account_number = naa.authorized_account_number
+    where naa.demo_id is null 
+)
+
+, rc_volumes_augment as (
+    select 
+        rc.date,
+        coalesce(rc.demo_id, saa.demo_id) as demo_id,
+        vendor_id,
+        rc.distributor_id,
+        account_number,
+        coalesce(rc.volume, saa.volume) as volume,
+        coalesce(rc.name, saa.name) as name,
+        saa.street_address,
+        saa.city,
+        saa.state,
+        saa.zip,
+        saa.email,
+        saa.phone
+    from rc_volumes rc 
+    left join synchrony_accounts_add saa
+        using(vendor_id, account_number)
+)
+    
+
+, all_volumes as (
+    select * from si_volumes 
+    union all 
+    select * from rc_volumes_augment
+    union all 
+    select * from lto_volumes
+    union all 
+    select * from pp_volumes
+    union all 
+    select * from ccp_volumes
+    union all 
+    select * from if_volumes
+)
+
+, avg_volumes as (
+    select 
+        demo_id,
+        name,
+        street_address,
+        city,
+        state,
+        zip,
+        email,
+        phone,
+        vendor_id,
+        distributor_id,
+        account_number,
+        sum(volume) as total_volume,
+        avg(volume) as avg_volume,
+        count(distinct date) as n_months,
+        min(date) as min_date,
+        max(date) as max_date
+    from all_volumes
+    group by all
+)
+
+select 
+    av.vendor_id,
+    nsv.name as vendor_name,
+    av.distributor_id,
+    nsd.name as distributor_name, 
+    account_number,
+    av.name,
+    av.street_address,
+    av.city,
+    av.state,
+    av.zip,
+    av.email,
+    av.phone,
+    av.total_volume,
+    av.avg_volume,
+    av.min_date,
+    av.max_date,
+    av.n_months,
+    (naa.authorized_account_number is not null) as exists_in_ns
+from avg_volumes av
+left join demo_staging_netsuite.netsuite_authorized_accounts naa
+    on coalesce(av.distributor_id,av.vendor_id) = naa.vendor_customer_id
+    and av.account_number = naa.authorized_account_number
+left join demo_staging_netsuite.netsuite_vendors nsv 
+    on av.vendor_id = nsv.id 
+left join demo_staging_netsuite.netsuite_vendors nsd 
+    on av.distributor_id = nsd.id 
+where 
+    (av.demo_id = 0 or av.demo_id is null)
+    and account_number is not null and account_number not in ('', ' ')
+group by all 
+order by account_number

@@ -1,0 +1,176 @@
+config {
+  type: "operations",
+  name: "demo_sources_products_restore_deletes",
+  tags: ["bia_op daily"]
+}
+-- run daily
+-- huge assumption here >>>> assuming ordinal_position=1 is always the unique key/id field
+
+DECLARE v_sql STRING;
+
+DECLARE v_target_project STRING DEFAULT 'demo-project';
+DECLARE v_target_dataset STRING DEFAULT 'demo_sources_products';
+
+FOR r IN (
+  
+  SELECT
+    table_catalog,
+    table_schema,
+    table_name,
+    column_name AS id_field
+  FROM
+    `demo-project.product_data_production.INFORMATION_SCHEMA.COLUMNS`
+  WHERE
+    ordinal_position = 1
+  ORDER BY
+    table_name
+
+)
+
+DO
+
+  ------------------------------------------------------------------
+  -- Create snapshot of yesterday's table
+  -- If the table is new (no time travel available), fall back to
+  -- snapshotting the current state so the diff finds no deletions
+  ------------------------------------------------------------------
+  
+  BEGIN
+    SET v_sql = FORMAT("""
+      
+      CREATE OR REPLACE TEMP TABLE yesterday_snapshot AS
+      SELECT *
+      FROM `%s.%s.%s`
+      FOR SYSTEM_TIME AS OF TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 DAY)
+    
+    """,
+      r.table_catalog,
+      r.table_schema,
+      r.table_name
+    );
+    
+    EXECUTE IMMEDIATE v_sql;
+    
+  EXCEPTION WHEN ERROR THEN
+    
+    -- Table is too new for time travel; snapshot current state instead
+    SET v_sql = FORMAT("""
+      
+      CREATE OR REPLACE TEMP TABLE yesterday_snapshot AS
+      SELECT *
+      FROM `%s.%s.%s`
+    
+    """,
+      r.table_catalog,
+      r.table_schema,
+      r.table_name
+    );
+    
+    EXECUTE IMMEDIATE v_sql;
+  
+  END;
+  
+  ------------------------------------------------------------------
+  -- Find IDs that existed yesterday but not today
+  ------------------------------------------------------------------
+  
+  SET v_sql = FORMAT("""
+    
+    CREATE OR REPLACE TEMP TABLE diffs AS
+    
+    SELECT %s
+    FROM yesterday_snapshot
+    
+    EXCEPT DISTINCT
+    
+    SELECT %s
+    FROM `%s.%s.%s`
+  
+  """,
+    r.id_field,
+    r.id_field,
+    r.table_catalog,
+    r.table_schema,
+    r.table_name
+  );
+  
+  EXECUTE IMMEDIATE v_sql;
+  
+  ------------------------------------------------------------------
+  -- If deletions exist
+  ------------------------------------------------------------------
+  
+  IF (
+      SELECT COUNT(*)
+      FROM diffs
+     ) > 0 THEN
+    
+    SET v_sql = FORMAT("""
+      
+      CREATE OR REPLACE TABLE
+      `%s.%s.%s_%s`
+      AS
+      
+      WITH deleted_rows AS (
+        
+        SELECT y.*
+        FROM yesterday_snapshot y
+        INNER JOIN diffs d
+        USING (%s)
+      
+      )
+      
+      SELECT *
+      FROM `%s.%s.%s`
+      
+      UNION ALL
+      
+      SELECT *
+      FROM deleted_rows
+    
+    """,
+      v_target_project,
+      v_target_dataset,
+      r.table_schema,
+      r.table_name,
+      
+      r.id_field,
+      
+      r.table_catalog,
+      r.table_schema,
+      r.table_name
+    );
+    
+    EXECUTE IMMEDIATE v_sql;
+  
+  ELSE
+    
+    ----------------------------------------------------------------
+    -- No deletions; just copy current table
+    ----------------------------------------------------------------
+    
+    SET v_sql = FORMAT("""
+      
+      CREATE OR REPLACE TABLE
+      `%s.%s.%s_%s`
+      AS
+      
+      SELECT *
+      FROM `%s.%s.%s`
+    
+    """,
+      v_target_project,
+      v_target_dataset,
+      r.table_schema,
+      r.table_name,
+      
+      r.table_catalog,
+      r.table_schema,
+      r.table_name
+    );
+    
+    EXECUTE IMMEDIATE v_sql;
+  
+  END IF;
+
+END FOR;

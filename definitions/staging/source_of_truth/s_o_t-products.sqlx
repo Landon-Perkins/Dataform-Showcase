@@ -1,0 +1,496 @@
+config { type: "table",
+        name: "products",
+        schema: "demo_staging",
+        description: "Standardized product master with category, brand, and price logic used across downstream POS and reporting models.",
+        tags: ["pos",
+        "demo_staging",
+        // "s_o_t 1 hour"
+        ],
+        bigquery: {
+          labels: {
+            scheduler: "dataform",
+            has_snapshot: "false",
+            frequency: "hourly"
+          }
+        },
+        assertions: {
+          uniqueKey: ["key"]
+          },
+        // dependencies: ["asrt-products_key_dupes"] // moved to run in parallel instead of dependent
+        }
+
+-- Change Log:
+-- 2024-01-29 | Stakeholder | Needed to add a field from source table but could not alter earlier GROUP BY clause. So I added it  at the end.
+-- 2024-02-22 | Stakeholder | Added DISTINCT to the join to remove duplicates from source data.
+-- 2024-11-22 | Stakeholder | some times the data load of products.products creates duplicates and this accounts for those.
+-- 2026-06-04 | Stakeholder | Switched to new products driver source. Old source was deprecated.
+
+WITH
+  dedupe as(
+    select
+              *
+            from ${ref("demo_sources_products", "products")} -- 2026-06-04 | Stakeholder | Switched to new products driver source. Old source was deprecated.
+            qualify row_number() over (partition by key order by updated_date desc)=1
+  ),
+  row_nos AS (
+    SELECT
+      CASE
+          WHEN brand_code="GE"
+              AND (REGEXP_CONTAINS(UPPER(description), r"GE PROFILE") OR description LIKE 'Profile%') THEN concat('GEPROF:',pn)
+          WHEN brand_code in ("GE","CAFEA") AND UPPER(description) LIKE "%MONOGRAM%" THEN concat("MONOGRAM:",pn)
+          ELSE p.key
+          END AS key,
+      p.key as original_key,
+      p.pn,
+      p.super_class_code,
+      sc.super_class_description,
+      p.major_class_code,
+      mjc.major_class_description,
+      p.minor_class_code,
+      mnc.minor_class_description,
+      CASE
+          WHEN brand_code="GE"
+              AND (REGEXP_CONTAINS(UPPER(description), r"GE PROFILE") OR description LIKE 'Profile%') THEN 'GEPROF'
+          WHEN brand_code in ("GE","CAFEA") AND UPPER(description) LIKE "%MONOGRAM%" THEN "MONOGRAM"
+          ELSE brand_code
+          END AS brand_code,
+      p.is_energy_star,
+      STRING_AGG(p.color_code_description ORDER BY updated_date DESC LIMIT 1) AS color_code_description,
+      CAST(STRING_AGG(CAST(p.height AS STRING) ORDER BY updated_date DESC LIMIT 1) AS FLOAT64) AS height,
+      CAST(STRING_AGG(CAST(p.width AS STRING) ORDER BY updated_date DESC LIMIT 1) AS FLOAT64) AS width,
+      CAST(STRING_AGG(CAST(p.depth AS STRING) ORDER BY updated_date DESC LIMIT 1) AS FLOAT64) AS depth,
+      STRING_AGG(p.description ORDER BY updated_date DESC LIMIT 1) AS description,
+      CAST(STRING_AGG(CAST(p.map AS STRING) ORDER BY updated_date DESC LIMIT 1) AS FLOAT64) AS map,
+      CAST(STRING_AGG(CAST(p.msrp AS STRING) ORDER BY updated_date DESC LIMIT 1) AS FLOAT64) AS msrp,
+      CAST(STRING_AGG(CAST(p.map_no_promos AS STRING) ORDER BY updated_date DESC LIMIT 1) AS FLOAT64) AS map_no_promos,
+      CAST(STRING_AGG(CAST(p.map_no_promos_end_date AS STRING) ORDER BY updated_date DESC LIMIT 1) AS DATE) AS map_no_promos_end_date,
+      CAST(STRING_AGG(CAST(p.map_just_promos AS STRING) ORDER BY updated_date DESC LIMIT 1) AS FLOAT64) AS map_just_promos,
+      CAST(STRING_AGG(CAST(p.map_just_promos_end_date AS STRING) ORDER BY updated_date DESC LIMIT 1) AS DATE) AS map_just_promos_end_date,
+      CAST(STRING_AGG(CAST(LEAST(p.map_no_promos, p.map_just_promos) AS STRING) ORDER BY updated_date DESC LIMIT 1) AS FLOAT64) AS map_with_promos,
+      IF(p.key LIKE 'SPQ%', 'LAUNDRY', ppc.system_major_category) AS showcase_major_category,
+      IF(p.key LIKE 'SPQ%', 'LAUNDRY', ppc.system_sub_category) AS showcase_sub_category,
+      ppc.system_minor_class AS showcase_minor_class,
+      ppc.system_major_class AS showcase_major_class,
+      IF(p.key LIKE 'SPQ%', 'LAUNDRY', ppc.t5_t6) AS t5_t6,
+      pks.total_pos_units,
+      pks.mean_unit_price,
+      pks.std_unit_price,
+      pks.pctl_25_unit_price,
+      pks.median_unit_price,
+      pks.pctl_75_unit_price,
+      pks.pctl_90_unit_price
+    FROM (
+      SELECT
+        key,
+        pn,
+        super_class_code,
+        major_class_code,
+        minor_class_code,
+        brand_code,
+        is_energy_star,
+        color_code_description,
+        height,
+        width,
+        depth,
+        short_description AS description,
+        map,
+        msrp,
+        map_no_promos,
+        map_no_promos_end_date,
+        map_just_promos,
+        map_just_promos_end_date,
+        updated_date
+      FROM dedupe -- 2024-11-22 | Stakeholder
+      UNION ALL -- Below creates American versions of Canadian products that are sold in the US but arent in the products database
+      SELECT
+        RIGHT(key, LENGTH(key) - 3) AS key,
+        pn,
+        super_class_code,
+        major_class_code,
+        minor_class_code,
+        RIGHT(brand_code, LENGTH(brand_code) - 3) AS brand_code,
+        is_energy_star,
+        color_code_description,
+        height,
+        width,
+        depth,
+        short_description AS description,
+        map,
+        msrp,
+        map_no_promos,
+        map_no_promos_end_date,
+        map_just_promos,
+        map_just_promos_end_date,
+        updated_date
+      FROM dedupe -- 2024-11-22 | Stakeholder
+      -- Some of the CA_ products already have US version, we don't want to duplicate those
+      WHERE pn IN(
+        SELECT
+          pn
+        FROM dedupe -- 2024-11-22 | Stakeholder
+        WHERE pn IN(
+          SELECT
+            DISTINCT
+              pn
+          FROM dedupe -- 2024-11-22 | Stakeholder
+          WHERE brand_code IN('CA_AMN','CA_BOSCH','CA_CAFEA','CA_DAN','CA_ELECTROLUX','CA_FORNO',
+            'CA_FPK','CA_FRIG','CA_GE','CA_HAR','CA_ICON','CA_JEN','CA_KTA','CA_LG','CA_MAY',
+            'CA_SAMSUNG','CA_SPQ','CA_THE','CA_WHIRL')
+        )
+      GROUP BY 1
+      HAVING COUNT(*) = 1
+      )
+      UNION ALL -- Manually adds fake 'product_key' for brands that don't share PNs in data
+      SELECT
+        key,
+        pn,
+        super_class_code,
+        major_class_code,
+        minor_class_code,
+        brand_code,
+        is_energy_star,
+        color_code_description,
+        height,
+        width,
+        depth,
+        short_description AS description,
+        map,
+        msrp,
+        map_no_promos,
+        map_no_promos_end_date,
+        map_just_promos,
+        map_just_promos_end_date,
+        updated_date
+      FROM `demo-project.sheets_staging.unmapped_products`
+      qualify row_number() OVER (PARTITION BY key, pn, brand_code) = 1
+    ) p
+    LEFT JOIN ${ref("demo_sources", "super_classes")} sc
+      ON p.super_class_code = sc.super_class_code
+    LEFT JOIN ${ref("demo_sources", "major_classes")} mjc
+      ON p.major_class_code = mjc.major_class_code
+    LEFT JOIN (
+      SELECT
+        minor_class_code,
+        MAX(minor_class_description) AS minor_class_description
+      FROM ${ref("demo_sources", "minor_classes")}
+      GROUP BY minor_class_code
+    ) mnc
+      ON p.minor_class_code = mnc.minor_class_code
+    LEFT JOIN ${ref("demo_sources", "showcase_product_categories")} ppc
+      ON ppc.minor_class_code = p.minor_class_code
+    LEFT JOIN ${ref("demo_sources", "product_key_stats")} pks
+      ON pks.product_key = p.key
+    -- GROUP BY 1,2,3,4,5,6,7,8,9,10,11,24,25,26,27,28,29,30,31,32,33,34,35
+    GROUP BY ALL
+  ), --/row_nos
+  clean AS (
+    SELECT
+      *,
+      ROW_NUMBER() OVER (PARTITION BY key ORDER BY key) AS row_no
+    FROM row_nos
+  ), --/clean
+  reclass AS (
+    SELECT
+    * EXCEPT(row_no)
+    FROM clean
+    WHERE row_no=1
+    AND key NOT IN ("LOL:WHIRLPOOL")), --/reclass -- Stakeholder - Added: 23-03-08 - Update super class code and description using new s_o_t reclassifications
+  super_class_fix AS(
+    SELECT
+      reclass.* EXCEPT (super_class_code,super_class_description),
+      IFNULL(rc.new_super_class_code,new_supers.super_class_code) AS super_class_code,
+      IFNULL(rc.new_super_class_description,new_supers.super_class_description) AS super_class_description,
+      CASE
+        WHEN UPPER(reclass.super_class_code) = "APPL" AND t5_t6 = "REF" THEN "REFRIGERATION"
+        WHEN UPPER(reclass.super_class_code) = "APPL" AND t5_t6 = "DISH" THEN "DISHWASHERS"
+        WHEN UPPER(reclass.super_class_code) = "APPL" AND t5_t6 = "BUILT-IN COOKING" THEN "COOKING"
+        WHEN UPPER(reclass.super_class_code) = "APPL" AND (t5_t6 = "OTHER" OR t5_t6 IS NULL) THEN "APPLIANCE OTHER"
+        ELSE t5_t6
+        END AS appliance_product_category
+    FROM reclass
+    LEFT JOIN ${ref("demo_staging", "reclassifications")} rc
+      ON reclass.minor_class_code = rc.minor_class_code
+    LEFT JOIN (SELECT
+                DISTINCT new_super_class_code AS super_class_code,
+                new_super_class_description AS super_class_description
+              FROM ${ref("demo_staging", "reclassifications")}) new_supers
+      ON new_supers.super_class_code=reclass.super_class_code),
+  cat_fix_prod_vert AS (
+  -- category fix and product_vertical fields
+    SELECT
+      * EXCEPT(showcase_major_category, showcase_sub_category),
+      CASE
+        WHEN showcase_major_category IS NULL AND super_class_code = 'APPL' THEN 'APPLIANCE OTHER'
+      ELSE showcase_major_category
+      END AS showcase_major_category,
+      CASE
+        WHEN showcase_sub_category IS NULL AND super_class_code = 'APPL' THEN 'APPLIANCE OTHER'
+      ELSE showcase_sub_category
+      END AS showcase_sub_category,
+      CASE
+        WHEN UPPER(super_class_code) = 'APPL' THEN 'APPL'
+        WHEN UPPER(super_class_code) = 'ELEC' THEN 'ELEC'
+        WHEN UPPER(super_class_code) = 'BED' THEN 'BED'
+        WHEN UPPER(super_class_code) = 'FURN' THEN 'FURN'
+        ELSE 'OTHER'
+        END AS product_vertical,
+      CASE
+        WHEN UPPER(super_class_code) = 'APPL' THEN 'APPLIANCES'
+        WHEN UPPER(super_class_code) = 'ELEC' THEN 'ELECTRONICS'
+        WHEN UPPER(super_class_code) = 'BED' THEN 'BEDDING'
+        WHEN UPPER(super_class_code) = 'FURN' THEN 'FURNITURE'
+        ELSE 'OTHER'
+        END AS product_vertical_description
+    FROM super_class_fix),
+  man_pn AS (
+  -- 2024-01-29 | Stakeholder
+  -- Needed to add a field from source table but could not alter earlier GROUP BY clause. So I added it here instead.
+    SELECT
+      cf.*,
+      p.manufacturer_pn
+    FROM cat_fix_prod_vert cf
+    LEFT JOIN dedupe p -- 2024-02-22 | Stakeholder
+    USING(key)
+  ),
+  p_maj_cat_fix AS (
+    SELECT
+      * EXCEPT(showcase_major_category, showcase_sub_category),
+      CASE
+        WHEN (showcase_major_category="APPLIANCE OTHER" OR showcase_sub_category="APPLIANCE OTHER") AND (UPPER(showcase_major_class)="OTHER" OR UPPER(showcase_minor_class)="OTHER") THEN "OTHER"
+        ELSE showcase_major_category
+        END AS showcase_major_category,
+      CASE
+        WHEN (showcase_major_category="APPLIANCE OTHER" OR showcase_sub_category="APPLIANCE OTHER") AND (UPPER(showcase_major_class)="OTHER" OR UPPER(showcase_minor_class)="OTHER") THEN "OTHER"
+        ELSE showcase_sub_category
+        END AS showcase_sub_category
+    FROM man_pn),
+  drop_tests AS (
+    SELECT
+      *
+    FROM p_maj_cat_fix
+    WHERE lower(brand_code) NOT IN ('test', 'smptst', 's1_encore', 'shptst')
+  ),
+  bedding_db AS (
+    SELECT
+      product_key AS key,
+      product_key AS original_key,
+      split(product_key, ":")[offset(1)] AS pn,
+      major_class_code,
+      major_class_description,
+      minor_class_code,
+      minor_class_description,
+      brand_code,
+      FALSE AS is_energy_star,
+      color_code_description,
+      SAFE_CAST(height AS FLOAT64) AS height,
+      SAFE_CAST(width AS FLOAT64) AS width,
+      SAFE_CAST(depth AS FLOAT64) AS depth,
+      collection_paragraph_description AS description,
+      CAST(NULL AS FLOAT64) AS map,
+      CAST(NULL AS FLOAT64) AS msrp,
+      CAST(NULL AS FLOAT64) AS map_no_promos,
+      CAST(NULL AS DATE) AS map_no_promos_end_date,--18
+      CAST(NULL AS FLOAT64) AS map_just_promos,
+      CAST(NULL AS DATE) AS map_just_promos_end_date,
+      CAST(NULL AS FLOAT64) AS map_with_promos,
+      CAST(NULL AS STRING) AS showcase_minor_class,
+      CAST(NULL AS STRING) AS showcase_major_class,
+      CAST(NULL AS STRING) AS t5_t6,
+      CAST(NULL AS FLOAT64) AS total_pos_units,
+      CAST(NULL AS FLOAT64) AS mean_unit_price,
+      CAST(NULL AS FLOAT64) AS std_unit_price,
+      CAST(NULL AS FLOAT64) AS pctl_25_unit_price,
+      CAST(NULL AS FLOAT64) AS median_unit_price,
+      CAST(NULL AS FLOAT64) AS pctl_75_unit_price,
+      CAST(NULL AS FLOAT64) AS pctl_90_unit_price,
+      super_class_code,
+      super_class_description,
+      CAST(NULL AS STRING) AS appliance_product_category,
+      CAST(NULL AS STRING) AS product_vertical,
+      CAST(NULL AS STRING) AS product_vertical_description,
+      manufacturer_pn,
+      CAST(NULL AS STRING) AS showcase_major_category,
+      CAST(NULL AS STRING) AS showcase_sub_category
+    FROM `demo-project.demo_sources_connor.union_bedding_db`
+    WHERE
+      product_key NOT IN (SELECT key FROM drop_tests)
+      AND major_class_code IS NOT NULL
+      AND minor_class_code IS NOT NULL
+      AND minor_class_description IS NOT NULL
+      AND major_class_description IS NOT NULL
+      AND not(
+        product_key in (
+          "SER:7001504629970",
+          "SER:7001504629870",
+          "SER:7001504629860",
+          "SER:7001504629960"
+        )
+        AND upc is null
+      )
+  ),
+  bedding_union AS (
+    SELECT * FROM drop_tests
+    UNION ALL
+    SELECT * FROM bedding_db
+  ),
+  s1_fix AS (
+    SELECT
+      * REPLACE(
+        REPLACE(key, "S1_", "") AS key,
+        REPLACE(original_key, "S1_", "") AS original_key,
+        REPLACE(pn, "S1_", "") AS pn
+      )
+    FROM bedding_union
+    WHERE
+      LEFT(key, 3) = "S1_"
+      AND key NOT IN (
+        SELECT DISTINCT CONCAT("S1_", key)
+        FROM bedding_union
+        WHERE
+          key IN (
+            SELECT DISTINCT REPLACE(key, "S1_", "") AS key
+            FROM bedding_union
+            WHERE LEFT(key, 3) = "S1_"
+          )
+      )
+  ),
+  s1_fix_union AS (
+    SELECT
+      *
+    FROM bedding_union
+    WHERE NOT STARTS_WITH(key, "S1_")
+    AND key NOT IN ('MOUF:MOUF9999') -- this key(s) had 2 records in the source one that started with "S1_" and one that did not.
+
+    UNION ALL
+
+    SELECT
+      *
+    FROM s1_fix
+  ),
+  minor_class_desc_fix AS (
+    SELECT
+      * REPLACE(
+        CASE
+          WHEN minor_class_description = "GR:GR36A" THEN '36" AND LARGER FREE STANDING GAS RANGE'
+          ELSE minor_class_description
+          END AS minor_class_description
+      )
+    FROM s1_fix_union
+  ),
+  -- adds generic keys for products that are missing.
+  generic_keys AS (
+    SELECT
+      generic_key AS key,
+      generic_key AS original_key,
+      CAST(NULL AS STRING) AS pn,
+      CAST(NULL AS STRING) AS major_class_code,
+      CAST(NULL AS STRING) AS major_class_description,
+      CAST(NULL AS STRING) AS minor_class_code,
+      CAST(NULL AS STRING) AS minor_class_description,
+      brand_code,
+      CAST(NULL AS BOOLEAN) AS is_energy_star,
+      CAST(NULL AS STRING) AS color_code_description,
+      SAFE_CAST(NULL AS FLOAT64) AS height,
+      SAFE_CAST(NULL AS FLOAT64) AS width,
+      SAFE_CAST(NULL AS FLOAT64) AS depth,
+      CAST(NULL AS STRING) AS description,
+      CAST(NULL AS FLOAT64) AS map,
+      CAST(NULL AS FLOAT64) AS msrp,
+      CAST(NULL AS FLOAT64) AS map_no_promos,
+      CAST(NULL AS DATE) AS map_no_promos_end_date,
+      CAST(NULL AS FLOAT64) AS map_just_promos,
+      CAST(NULL AS DATE) AS map_just_promos_end_date,
+      CAST(NULL AS FLOAT64) AS map_with_promos,
+      CAST(NULL AS STRING) AS showcase_minor_class,
+      CAST(NULL AS STRING) AS showcase_major_class,
+      CAST(NULL AS STRING) AS t5_t6,
+      CAST(NULL AS FLOAT64) AS total_pos_units,
+      CAST(NULL AS FLOAT64) AS mean_unit_price,
+      CAST(NULL AS FLOAT64) AS std_unit_price,
+      CAST(NULL AS FLOAT64) AS pctl_25_unit_price,
+      CAST(NULL AS FLOAT64) AS median_unit_price,
+      CAST(NULL AS FLOAT64) AS pctl_75_unit_price,
+      CAST(NULL AS FLOAT64) AS pctl_90_unit_price,
+      new_super_class_code as super_class_code,
+      new_super_class_description as super_class_description,
+      CAST(NULL AS STRING) AS appliance_product_category,
+      CAST(NULL AS STRING) AS product_vertical,
+      CAST(NULL AS STRING) AS product_vertical_description,
+      CAST(NULL AS STRING) AS manufacturer_pn,
+      CAST(NULL AS STRING) AS showcase_major_category,
+      CAST(NULL AS STRING) AS showcase_sub_category
+    FROM ${ref("demo_staging", "brand_categorizations")} AS bc
+    WHERE generic_key LIKE '%9999'
+      AND generic_key NOT IN (SELECT key FROM minor_class_desc_fix)
+  ),
+  more_generics AS (
+    SELECT
+      concat(brand_code, ":", category) AS key,
+      concat(brand_code, ":", category) AS original_key,
+      CAST(NULL AS STRING) AS pn,
+      CAST(NULL AS STRING) AS major_class_code,
+      CAST(NULL AS STRING) AS major_class_description,
+      CAST(NULL AS STRING) AS minor_class_code,
+      CAST(NULL AS STRING) AS minor_class_description,
+      brand_code,
+      CAST(NULL AS BOOLEAN) AS is_energy_star,
+      CAST(NULL AS STRING) AS color_code_description,
+      SAFE_CAST(NULL AS FLOAT64) AS height,
+      SAFE_CAST(NULL AS FLOAT64) AS width,
+      SAFE_CAST(NULL AS FLOAT64) AS depth,
+      CAST(NULL AS STRING) AS description,
+      CAST(NULL AS FLOAT64) AS map,
+      CAST(NULL AS FLOAT64) AS msrp,
+      CAST(NULL AS FLOAT64) AS map_no_promos,
+      CAST(NULL AS DATE) AS map_no_promos_end_date,
+      CAST(NULL AS FLOAT64) AS map_just_promos,
+      CAST(NULL AS DATE) AS map_just_promos_end_date,
+      CAST(NULL AS FLOAT64) AS map_with_promos,
+      CAST(NULL AS STRING) AS showcase_minor_class,
+      CAST(NULL AS STRING) AS showcase_major_class,
+      CAST(NULL AS STRING) AS t5_t6,
+      CAST(NULL AS FLOAT64) AS total_pos_units,
+      CAST(NULL AS FLOAT64) AS mean_unit_price,
+      CAST(NULL AS FLOAT64) AS std_unit_price,
+      CAST(NULL AS FLOAT64) AS pctl_25_unit_price,
+      CAST(NULL AS FLOAT64) AS median_unit_price,
+      CAST(NULL AS FLOAT64) AS pctl_75_unit_price,
+      CAST(NULL AS FLOAT64) AS pctl_90_unit_price,
+      "OTHER" AS super_class_code,
+      "OTHER" AS super_class_description,
+      CAST(NULL AS STRING) AS appliance_product_category,
+      CAST(NULL AS STRING) AS product_vertical,
+      CAST(NULL AS STRING) AS product_vertical_description,
+      CAST(NULL AS STRING) AS manufacturer_pn,
+      CAST(NULL AS STRING) AS showcase_major_category,
+      CAST(NULL AS STRING) AS showcase_sub_category
+    FROM
+      (SELECT DISTINCT
+          brand_code
+        FROM demo_staging.brand_categorizations
+        CROSS JOIN (SELECT "")
+      )
+    CROSS JOIN
+      (
+        SELECT category
+        FROM
+          UNNEST(
+            [
+              "PARTS", "SERVICE", "INSTALL", "WARRANTY", "DELIVERY", "LABOR",
+              "CREDITS"])
+            category
+      )
+    WHERE concat(brand_code, ":", category) NOT IN (SELECT key FROM minor_class_desc_fix)
+  ),
+  generic_union AS (
+    SELECT * FROM minor_class_desc_fix
+    UNION ALL
+    SELECT * FROM generic_keys
+    UNION ALL
+    SELECT * FROM more_generics
+  )
+
+
+SELECT
+  *
+FROM generic_union

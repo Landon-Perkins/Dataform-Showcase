@@ -1,0 +1,155 @@
+config { type: "table",
+        name: "pos_incl_excep",
+        schema: "demo_staging",
+        description: "POS transaction staging model with product enrichment, exception flags, and member-level quality checks.",
+        tags: ["demo_staging","pos"],
+        assertions:{
+          uniqueKey:["id"]}
+        }
+-- Change Log
+-- 23-05-24 | Stakeholder | added activity_tracking google sheet which filters records on the most recent contact_date
+-- 2026-07-23 | Stakeholder | Added product matching v4 algorithm into the transformation.
+
+WITH pos AS (
+  SELECT
+    pos.* EXCEPT(KEY,
+      product_key,
+      demo_id,
+      price,
+      units,
+      unit_price
+      ),
+    CASE
+      WHEN pos.demo_id=1051 THEN 1739
+      WHEN pos.demo_id=1090 THEN 1534
+      ELSE pos.demo_id
+      END AS demo_id,
+    bc.*,
+    pos.product_key AS old_product_key,--pos v1 product_key
+    pos.key AS product_key,
+    misc.new_super_class_code AS misc_super_class_code,
+    misc.new_super_class_description AS misc_super_class_description,
+    CONCAT(IFNULL(CAST(pos.date AS string),""),IFNULL(CAST(pos.demo_id AS string),""),IFNULL(pos.location,""),"-", IFNULL(pos.invoice_number,"")) AS unique_invoice_number,
+    CASE
+      WHEN pos.unit_price = 0 THEN FALSE
+      WHEN pos.key LIKE "DEMO_MEMBER%" OR pos.key LIKE "DEMO_GENERIC%" THEN FALSE
+      WHEN (COUNT(pos.unit_price*pos.units) OVER product_key_window) > 10 AND (ABS(abs(pos.unit_price)-(AVG(ABS(pos.unit_price)) OVER product_key_window))/ IF (ABS(pos.unit_price)>0.01,ABS(pos.unit_price),NULL))>.50 THEN TRUE
+      ELSE FALSE
+    END AS outlier_criteria,
+    DATE_TRUNC(pos.date,month) AS t_date,
+    DATE_SUB(DATE_TRUNC(pos.date,month),INTERVAL 1 month) AS t_date_prior_month,
+    EXTRACT(year FROM pos.date) AS year,
+    EXTRACT(year FROM pos.date)-1 AS year_prior,
+    EXTRACT(quarter FROM pos.date) AS quarter,
+    EXTRACT(month FROM pos.date) AS month,
+    FORMAT_DATE("%B",pos.date) AS month_name,
+    FORMAT_DATE("%b",pos.date) AS abbrv_month_name,
+    SPLIT(pos.key,":")[OFFSET(1)] AS sku,
+    pos.price AS original_price,
+    pos.units AS original_units,
+    pos.unit_price AS original_unit_price,
+    IF (pos.price=0,TRUE,FALSE) AS zero_price,
+    IF (pos.units=0,TRUE,FALSE) AS zero_units,
+    IF (pos.demo_id IS NULL,TRUE,FALSE) AS missing_demo_id,
+    IF (pos.date IS NULL,TRUE,FALSE) AS missing_date,
+    IF (pos.price=0,"Zero Price Error, ","") AS zero_price_error,
+    IF (pos.units=0,"Zero Units Error, ","") AS zero_units_error,
+    IF (pos.demo_id IS NULL,"Missing demo ID Error, ","") AS missing_demo_id_error,
+    IF (pos.date IS NULL,"Missing Date Error, ","") AS missing_date_error,
+    IF (pos.unit_price=0.01,TRUE,FALSE) AS penny_sale,
+    IF (pos.units<0,ABS(price)*-1,price) AS price,
+    IF (pos.price<0 AND pos.pos_transaction_category IS NULL,ABS(units)*-1,units) AS units, --assigning misc categories actual units (e.g. 1 unit credit with negative dollar am  ount makes sense)
+    ABS(pos.unit_price) AS unit_price,
+    COUNT(pos.units) OVER product_key_window AS product_volume,
+    AVG(ABS(pos.unit_price)) OVER product_key_window AS product_average_unit_price,
+    COUNT(pos.unit_price*pos.units) OVER product_key_window AS product_revenue,
+    pt.showcase_sales_type AS pos_sales_transaction_type, -- 2026-04-23 | Stakeholder | added @Stakeholder
+    algo_v4.final_key AS product_key_v4,
+    algo_v4.brand_code_v4,
+    algo_v4.brand_name_v4,
+    algo_v4.parent_brand_code_v4,
+    algo_v4.parent_brand_name_v4,
+    ABS(pos.unit_price) AS unit_price_v4,
+    COUNT(pos.units) OVER product_key_window_v4 AS product_volume_v4,
+    AVG(ABS(pos.unit_price)) OVER product_key_window_v4 AS product_average_unit_price_v4,
+    COUNT(pos.unit_price*pos.units) OVER product_key_window_v4 AS product_revenue_v4,
+  FROM ${ref("demo_staging", "member_sale_outs")} pos
+  LEFT JOIN ${ref("demo_staging","brand_categorizations")} bc
+  ON bc.brand_code=SPLIT(pos.key,":")[OFFSET(0)]
+  LEFT JOIN ${ref("product_sku_match","pos_algo_v2_misc_category_keys")} misc
+  ON misc.key=pos.key
+  LEFT JOIN ${ref("demo_staging","brands")} bcats
+  ON bcats.brand_code=bc.brand_code
+  LEFT JOIN ${ref("demo_staging", "pos_tracking_sheet")} pt -- 2026-04-23 | Stakeholder | added @Stakeholder
+  ON pos.demo_id = pt.demo_id
+  LEFT JOIN (
+    SELECT
+      algo_v4.*,
+      bc.brand_code AS brand_code_v4,
+      bc.brand_name AS brand_name_v4,
+      bc.parent_brand_name AS parent_brand_name_v4,
+      bc.parent_brand_code AS parent_brand_code_v4
+    FROM
+       `demo-project.demo_staging.pos_algo_v4_final` AS algo_v4
+      INNER JOIN ${ref("demo_staging", "products")} AS products
+        ON products.key = algo_v4.final_key
+      LEFT JOIN ${ref("demo_staging", "brand_categorizations")} AS bc
+        ON bc.brand_code = products.brand_code
+  ) algo_v4
+    ON algo_v4.demo_id = pos.demo_id_from_mso
+    AND IFNULL(algo_v4.member_brand, '') = IFNULL(pos.member_brand_from_mso, '')
+    AND IFNULL(algo_v4.pn, '') = IFNULL(pos.pn_from_mso, '')
+  WHERE coalesce(date,delivery_date)<=CURRENT_DATE()
+  WINDOW
+    product_key_window AS (PARTITION BY pos.key),
+    product_key_window_v4 AS (PARTITION BY algo_v4.final_key)
+),
+mem_activity as (
+  SELECT
+    mso.*,
+    IF(ex.demo_id IS NOT NULL, TRUE, FALSE) AS exception_excluded,
+    act.contact_date AS pos_member_contact_date,
+    act.contact_method AS pos_member_contact_method,
+    act.pipeline_type AS pos_member_activity_type,
+    act.activity_cat AS pos_member_activity_category
+  FROM pos mso
+  LEFT JOIN ${ref("demo_sources","mvw_pos_exceptions")} ex
+    ON ex.demo_id=mso.demo_id
+  -- Stakeholder | 23-05-24 | Below JOIN filters on the most recent contact_date
+  LEFT JOIN (SELECT
+              * EXCEPT(contact_date),
+              contact_date AS contact_date
+            FROM (
+              SELECT
+                demo_id,
+                contact_method,
+                pipeline_type,
+                activity_cat,
+                contact_date,
+                MAX(contact_date) OVER (PARTITION BY demo_id) AS max_contact_date
+              FROM `demo-project.sheets_staging.activity_tracking`
+              WHERE UPPER(contact_type) = 'MEMBER'
+              GROUP BY
+                demo_id,
+                contact_method,
+                pipeline_type,
+                activity_cat,
+                contact_date )
+            WHERE max_contact_date = contact_date) act
+    ON mso.demo_id = act.demo_id
+),
+pos_file_exclusions as(
+  -- Uses a google sheet to exclude records by `member_sale_outs_import_id` name.
+  -- Stakeholder maintains google sheet.
+  SELECT
+    *
+  FROM mem_activity
+  WHERE member_sale_outs_import_id not in (select
+                                            member_sale_outs_import_id
+                                          from `demo-project.sheets_staging.pos_file_exclusions`
+                                          where member_sale_outs_import_id is not null)
+)
+
+SELECT
+  *
+FROM pos_file_exclusions

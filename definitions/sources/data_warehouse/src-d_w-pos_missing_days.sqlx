@@ -1,0 +1,118 @@
+config {
+    type: "table",
+    schema: "demo_sources",
+    name: "pos_missing_days",
+    tags: ["pos","independent assertion daily"]
+}
+
+with all_dates as (
+    select 
+        date_add('2024-01-01', interval offset day) as transaction_day,
+        extract(dayofweek from date_add('2024-01-01', interval offset day)) as dow
+    from unnest(generate_array(0, date_diff(current_date, '2024-01-01', day))) as offset
+),
+
+member_info as (
+    select 
+        demo_id,
+        cast(remit_freq as int) as remit_freq
+    from demo_sources.pos_tracking_historical
+    where remit_freq is not null
+    qualify row_number() over (partition by demo_id order by snapshot_timestamp desc) = 1
+),
+
+member_data AS (
+    SELECT demo_id,
+        DATE(date) AS transaction_day,
+        SUM(price) AS total_dollars,
+        SUM(units) AS total_units
+    FROM `demo_reporting.pos_incl_excep`
+    WHERE 
+        date between date_trunc(current_date,year) and current_date
+        and exception_excluded = false
+    GROUP BY demo_id, transaction_day
+),
+
+all_demo_dates AS (
+    SELECT md.demo_id, transaction_day
+    FROM (SELECT DISTINCT demo_id FROM member_data) md
+    CROSS JOIN all_dates ad 
+    left join sheets_staging.pos_member_open_days do
+        on md.demo_id = do.demo_id 
+    where 
+        transaction_day not in (select date from demo_sources_connor.holiday_dates)
+        and (
+            (ad.dow = 1 and do.dow_sunday = 1) or 
+            (ad.dow = 2 and do.dow_monday = 1) or 
+            (ad.dow = 3 and do.dow_tuesday = 1) or 
+            (ad.dow = 4 and do.dow_wednesday = 1) or 
+            (ad.dow = 5 and do.dow_thursday = 1) or 
+            (ad.dow = 6 and do.dow_friday = 1) or 
+            (ad.dow = 7 and do.dow_saturday = 1) 
+        )
+        and transaction_day >= date_trunc(current_date,year)
+),
+
+missing_dates AS (
+    SELECT demo_id,
+        STRING_AGG(FORMAT_DATE('%m/%d/%Y', transaction_day),', ' ORDER BY transaction_day ASC) AS missing_dates
+    FROM (
+        SELECT ad.demo_id, ad.transaction_day
+        FROM all_demo_dates ad
+        LEFT JOIN member_data md 
+            ON ad.demo_id = md.demo_id 
+            AND ad.transaction_day = md.transaction_day
+        left join member_info mi on ad.demo_id = mi.demo_id
+        WHERE 
+            md.demo_id IS NULL
+            and ad.transaction_day <= date_sub(current_date(), interval remit_freq day)
+    ) subquery
+    GROUP BY demo_id
+)
+
+,final as (
+SELECT 
+    ad.demo_id,
+    mems.company_name,
+    mems.current_pos_provider,
+    max(ad.transaction_day) as max_date,
+    COUNT(DISTINCT ad.transaction_day) AS total_days,
+    COUNT(DISTINCT md.transaction_day) AS days_with_data,
+    SUM(md.total_dollars) AS total_dollars,
+    SUM(md.total_units) AS total_units,
+    ifnull(m.missing_dates, 'No missing dates') AS missing_dates,
+    date_trunc(current_timestamp(),second) as date_ran
+FROM all_demo_dates ad
+LEFT JOIN member_data md 
+    ON ad.demo_id = md.demo_id 
+    AND ad.transaction_day = md.transaction_day
+LEFT JOIN missing_dates m ON ad.demo_id = m.demo_id
+left join `demo_staging_netsuite.membership` mems on mems.demo_id = ad.demo_id
+GROUP BY 
+    ad.demo_id, 
+    m.missing_dates, 
+    mems.company_name, 
+    mems.current_pos_provider
+)
+
+select 
+    demo_id,
+    company_name,
+    current_pos_provider,
+    total_days,
+    days_with_data,
+    if(total_days<=days_with_data,'Yes','No') as all_days_covered,
+    IF(
+        (total_days-remit_freq <= days_with_data)
+        and (missing_dates='No missing dates'), 
+        'Yes', 
+        'No'
+    ) AS all_days_covered_within_remit_freq,
+    missing_dates,
+    remit_freq,
+    max_date,
+    total_dollars,
+    total_units,
+    date_ran
+from final f
+left join member_info mi using(demo_id)

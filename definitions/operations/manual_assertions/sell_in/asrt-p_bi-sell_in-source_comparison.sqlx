@@ -1,0 +1,84 @@
+config {
+    type: "assertion",
+    tags: ["sell_in","stand_alone","independent assertion daily"]
+}
+
+with 
+direct as (
+  select
+    vendor_id,
+    distributor_id, 
+    filename, 
+    import_ts,
+    sum(volume) as volume,
+    sum(units) as units,
+    count(*) as row_count
+  from ${ref("demo_sources","sell_in_direct")}
+--   from demo_sources.sell_in_direct
+  group by all
+),
+
+old as (
+  select 
+    vendor_id,
+    distributor_id,
+    filename,
+    cast(created_date as timestamp) as import_ts,
+    sum(volume) as volume,
+    sum(units) as units,
+    count(*) as row_count
+  from demo_sources.member_sales ms
+  left join demo_sources.member_sale_imports i
+    on i.id = ms.member_sale_import_id
+  group by all
+),
+
+dw as (
+  select * from direct 
+  union all 
+  select * from old 
+),
+
+pbi as (
+  select 
+    vendor_id,
+    distributor_id,
+    filename,
+    import_ts,
+    sum(volume) as volume,
+    sum(units) as units,
+    count(*) as row_count
+  from ${ref("demo_reporting","sell_in")}
+  group by all
+)
+
+select 
+  dw.vendor_id dw_vendor_id,
+  pbi.vendor_id pbi_vendor_id,
+  dw.distributor_id dw_distributor_id,
+  pbi.distributor_id pbi_distributor_id,
+  dw.import_ts,
+  dw.filename,
+  dw.volume dw_volume,
+  pbi.volume pbi_volume,
+  dw.volume-pbi.volume volume_diff,
+  dw.units dw_units,
+  pbi.units pbi_units,
+  dw.units-pbi.units units_diff,
+  dw.row_count dw_row_count,
+  pbi.row_count pbi_row_count,
+  dw.row_count-pbi.row_count row_count_diff
+from dw
+full outer join pbi 
+  on ifnull(dw.vendor_id,1) = ifnull(pbi.vendor_id,1)
+  and ifnull(dw.distributor_id,1) = ifnull(pbi.distributor_id,1)
+  and dw.filename = pbi.filename
+  and dw.import_ts = pbi.import_ts
+where 
+  pbi.vendor_id not in (
+    13413, -- needed because we filter out sales from speed queen, so they will always appear lower
+    127521 -- bedding is moved from ashely furn to ashely bedding, so will always show lower 
+  )
+  and (abs(dw.volume-pbi.volume) > 1
+  or abs(dw.units-pbi.units) > 1
+  or abs(dw.row_count-pbi.row_count) > 0)

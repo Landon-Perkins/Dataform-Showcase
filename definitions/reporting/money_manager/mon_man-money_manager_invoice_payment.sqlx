@@ -1,0 +1,160 @@
+config {
+    type: "table",
+    name: "money_manager_invoice_payment",
+    schema: "money_manager",
+    description: "Finance reconciliation model that links invoice payments to the associated invoice records and applied amounts.",
+    tags: ["money_manager"],
+    bigquery: {
+        labels: {
+            scheduler: "dataform",
+            refresh: "hourly",
+            author: "Stakeholder"
+        }
+    },
+    columns: {
+        netsuite_id: "demo_platform identifier for the invoice.",
+        invoice_number: "Invoice number or reference.",
+        invoice_date: "Date of the invoice.",
+        memo: "Memo or note associated with the invoice.",
+        demo_id: "Unique identifier for the member or entity.",
+        original_entity_id: "Original identifier for the entity associated with the invoice.",
+        invoice_total: "Total amount of the invoice.",
+        amount_due: "Amount due or outstanding on the invoice.",
+        last_update: "Last update date for the invoice.",
+        invoice_status_netsuite_id: "demo_platform identifier for the invoice status.",
+        invoice_status_int_netsuite_id: "Integer representation of the invoice status in demo_platform.",
+        invoice_status_name: "Name or description of the invoice status.",
+        previous_demo_id: "Previous demo ID associated with the invoice."
+    }
+}
+
+WITH
+  invoice_payment AS (
+    SELECT
+      transaction AS payment_id
+    FROM
+      ${ref("money_manager", "money_manager")}
+    WHERE
+      transaction_type = "CustPymt"
+      --and subsidiary_id=6
+      AND tranlineid = 1
+      AND lrs_customer_type = 3 --might bring this back
+  ),
+  prefin AS (
+    SELECT
+      next.previousdoc AS invoice_netsuite_id,
+      ip.payment_id AS payment_netsuite_id,
+      next.foreignamount AS applied_amount
+    FROM
+      invoice_payment ip
+      LEFT JOIN (
+        SELECT DISTINCT
+          nextdoc,
+          previousdoc,
+          foreignamount
+        FROM
+          ${ref("netsuite_suiteanalytics", "nexttransactionlinelink")}
+        WHERE
+          foreignamount IS NOT NULL
+          AND _fivetran_deleted = FALSE
+      ) next ON next.nextdoc = ip.payment_id
+  ),
+  finalize AS (
+    SELECT
+      invoice_netsuite_id,
+      payment_netsuite_id,
+      SUM(applied_amount) AS applied_amount
+    FROM
+      prefin
+    GROUP BY
+      invoice_netsuite_id,
+      payment_netsuite_id
+    HAVING
+      applied_amount IS NOT NULL
+  )
+SELECT
+  *
+FROM
+  finalize
+WHERE
+  invoice_netsuite_id IN (
+    SELECT DISTINCT
+      netsuite_id
+    FROM
+      ${ref("money_manager", "money_manager_invoices")}
+  )
+  AND payment_netsuite_id NOT IN (
+    SELECT DISTINCT
+      payment_netsuite_id
+    FROM
+      (
+        SELECT
+          payment_netsuite_id,
+          SUM(applied_amount) AS total_applied,
+          SUM(ABS(applied_amount)) AS abs_applied
+        FROM
+          (
+            WITH
+              invoice_payment AS (
+                SELECT
+                  transaction AS payment_id
+                FROM
+                  ${ref("money_manager", "money_manager")}
+                WHERE
+                  transaction_type = "CustPymt"
+                  --and subsidiary_id=6
+                  AND tranlineid = 1
+                  AND lrs_customer_type = 3 --might bring this back
+              ),
+              prefin AS (
+                SELECT
+                  next.previousdoc AS invoice_netsuite_id,
+                  ip.payment_id AS payment_netsuite_id,
+                  next.foreignamount AS applied_amount
+                FROM
+                  invoice_payment ip
+                  LEFT JOIN (
+                    SELECT DISTINCT
+                      nextdoc,
+                      previousdoc,
+                      foreignamount
+                    FROM
+                      ${ref("netsuite_suiteanalytics", "nexttransactionlinelink")}
+                    WHERE
+                      foreignamount IS NOT NULL
+                      AND _fivetran_deleted = FALSE
+                  ) next ON next.nextdoc = ip.payment_id
+              ),
+              finalize AS (
+                SELECT
+                  invoice_netsuite_id,
+                  payment_netsuite_id,
+                  SUM(applied_amount) AS applied_amount
+                FROM
+                  prefin
+                GROUP BY
+                  invoice_netsuite_id,
+                  payment_netsuite_id
+                HAVING
+                  applied_amount IS NOT NULL
+              )
+            SELECT
+              *
+            FROM
+              finalize
+            WHERE
+              invoice_netsuite_id IN (
+                SELECT DISTINCT
+                  netsuite_id
+                FROM
+                  ${ref("money_manager", "money_manager_invoices")}
+              )
+          )
+        GROUP BY
+          payment_netsuite_id
+        HAVING
+          total_applied = 0
+          AND abs_applied = 0
+      )
+  )
+

@@ -1,0 +1,27 @@
+config {
+    type: "incremental",
+    name: "d_w-mso_raw_load_z_score_log",
+    schema: "dataform_assertions",
+    bigquery: {
+        labels: {
+            scheduler: "dataform",
+            frequency: "2_hour",
+            author: "Stakeholder"
+        }
+    },
+    tags: ["pos", "log"],
+    protected: true,
+}
+
+-- Change Log
+-- 2026-05-01 | Stakeholder | Initial build
+
+-- Specifications: Captures assertion results each time asrt-d_w-mso_raw_load_z_score runs.
+--                 The dependency on the assertion name ensures this log runs after the assertion.
+--                 Add this log table as a dependency on sot.member_sale_outs when ready to
+--                 wire the assertion into the pipeline.
+
+select
+    *,
+    current_datetime("America/New_York") as capture_date_us_east
+from `demo-project.dataform_assertions.asrt-d_w-mso_raw_load_z_score`

@@ -1,0 +1,27 @@
+config {
+    type: "incremental",
+    name: "sell_in_aggr_snapshots",
+    schema: "demo_reporting_snapshots",
+    bigquery: {
+        labels: {
+            scheduler: "dataform",
+            frequency: "daily"
+        },
+        partitionBy: "DATETIME_TRUNC(snapshot_date_us_east, day)"
+    },
+    tags: [
+        "snapshots daily 10pm",
+        "sell_in"
+    ],
+    protected: true
+}
+
+SELECT
+  date,
+  vendor_id,
+  distributor_id,
+  sum(volume) AS total_volume,
+  sum(units) AS total_units,
+  current_datetime("America/New_York") AS snapshot_date_us_east
+FROM `demo-project.demo_reporting.sell_in`
+GROUP BY ALL

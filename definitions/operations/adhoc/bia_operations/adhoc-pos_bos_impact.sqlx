@@ -1,0 +1,153 @@
+config { type: "operations",
+        name: "pos_bos_impact",
+        schema: "bia_operations",
+        hasOutput: true,
+        tags: ["bia_op daily 12pm"]
+        }
+
+
+BEGIN
+DECLARE
+  days_back int64 DEFAULT 1; 
+
+CREATE TEMP TABLE prev AS (
+  SELECT
+    t_date AS date,
+    "days ago" AS data_source,
+    IFNULL(parent_brand_code,"") AS parent_brand_code,
+    IFNULL(parent_brand_name,"") AS parent_brand_name,
+    COUNT(DISTINCT demo_id) AS dealers_before,
+    SUM(price) AS pos_before
+  FROM
+    `demo-project.demo_reporting.pos_incl_excep` FOR system_time AS OF TIMESTAMP_SUB(CURRENT_TIMESTAMP(),INTERVAL days_back day)
+  WHERE
+    exception=FALSE
+    AND exception_excluded=FALSE
+    AND super_class="APPLIANCES"
+    AND country_of_origin="USA"
+    AND extract(year FROM date)>=2021
+  GROUP BY
+    date,
+    parent_brand_code,
+    parent_brand_name);
+END;
+
+CREATE OR REPLACE TABLE ${self()}
+  OPTIONS(description = "Balance of shares data from POS day over day",
+    labels = [("scheduler", "dataform"),
+              ("frequency", "daily_12pm"),
+              ("author", "Stakeholder"),
+              ("has_snapshot", "false")])
+  AS (
+WITH
+  current_state AS (
+  SELECT
+    t_date AS date,
+    "now" AS data_source,
+    IFNULL(parent_brand_code,"") AS parent_brand_code,
+    IFNULL(parent_brand_name,"") AS parent_brand_name,
+    COUNT(DISTINCT demo_id) AS dealers_now,
+    SUM(price) AS pos_now
+  FROM
+    `demo-project.demo_reporting.pos_incl_excep`
+  WHERE
+    exception=FALSE
+    AND exception_excluded=FALSE
+    AND super_class="APPLIANCES"
+    AND country_of_origin="USA"
+    AND extract(year FROM date)>=2021
+  GROUP BY
+    date,
+    parent_brand_code,
+    parent_brand_name),
+  dates AS (
+  SELECT
+    DISTINCT *
+  FROM (
+    SELECT
+      DISTINCT parent_brand_name,
+      date
+    FROM
+      current_state
+    UNION ALL
+    SELECT
+      DISTINCT parent_brand_name,
+      date
+    FROM
+      prev ) ),
+  fine AS (
+  SELECT
+    CURRENT_DATE() AS date_ran,
+    dates.* EXCEPT(date),
+    IFNULL(brands.is_showcase,FALSE) AS is_showcase,
+    FORMAT_DATE("%B %Y",dates.date) AS month_affected,
+    prev.dealers_before,
+    current_state.dealers_now,
+    prev.pos_before,
+    current_state.pos_now,
+    current_state.pos_now-prev.pos_before AS var,
+    ABS(current_state.pos_now-prev.pos_before) AS abs_var,
+  FROM
+    dates
+  LEFT JOIN
+    prev
+  ON
+    prev.date=dates.date
+    AND prev.parent_brand_name=dates.parent_brand_name
+  LEFT JOIN
+    current_state
+  ON
+    current_state.date=dates.date
+    AND current_state.parent_brand_name=dates.parent_brand_name
+  LEFT JOIN (
+    SELECT
+      DISTINCT parent_brand_name,
+      is_showcase
+    FROM
+      `demo-project.demo_staging.brands`
+    WHERE
+      is_showcase=TRUE ) brands
+  ON
+    brands.parent_brand_name=dates.parent_brand_name ),
+  gt AS (
+  SELECT
+    month_affected,
+    SUM(pos_before) AS totvol_before,
+    SUM(pos_now) AS totvol_now
+  FROM
+    fine
+  GROUP BY
+    month_affected ),
+  finito AS(
+  SELECT
+    *,
+    fine.pos_before/gt.totvol_before AS bos_before,
+    fine.pos_now/gt.totvol_now AS bos_now
+  FROM
+    fine
+  LEFT JOIN
+    gt
+  USING
+    (month_affected))
+
+SELECT
+  month_affected,
+  date_ran,
+  parent_brand_name,
+  is_showcase,
+  dealers_before,
+  dealers_now,
+  finito.bos_before,
+  finito.bos_now,
+  finito.bos_now-finito.bos_before AS bos_variance,
+  finito.pos_before,
+  finito.pos_now,
+  finito.var,
+  finito.abs_var,
+  finito.totvol_before,
+  finito.totvol_now
+FROM
+  finito);
+
+-- Clean up
+DROP TABLE prev;

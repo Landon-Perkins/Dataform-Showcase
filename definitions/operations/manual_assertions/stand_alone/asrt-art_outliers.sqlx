@@ -1,0 +1,91 @@
+config {
+  type: "assertion",
+  tags: ["independent assertion weekly"],
+}
+
+
+-- purpose: assertion to see outliers by product. do not block art from running if assertion throws errors. should ideally produce 0 results 
+-- if something appears then flag and investigate. please tell Stakeholder if unable to find answers. 
+
+WITH
+  global_product_margin_means_stddevs AS (
+    SELECT
+      product_key,
+      COUNT(*) AS global_line_count,
+      minor_class_code,
+      price_bucket_label,
+      AVG(dealer_margin) AS global_product_margin_mean,
+      STDDEV(dealer_margin) AS global_product_margin_stddev
+    FROM
+      `demo-project.demo_reporting.art_reporting`
+    WHERE
+      dealer_margin > 0
+    GROUP BY
+      ALL
+  ),
+  peer_product_margin_means_stddevs AS (
+    SELECT
+      product_key,
+      peer_segmentation,
+      COUNT(*) AS peer_line_count,
+      minor_class_code,
+      price_bucket_label,
+      AVG(dealer_margin) AS global_product_margin_mean,
+      STDDEV(dealer_margin) AS global_product_margin_stddev
+    FROM
+      `demo-project.demo_reporting.art_reporting`
+    WHERE
+      dealer_margin > 0
+    GROUP BY
+      ALL
+  ),
+  assertion_z_score_calc AS (
+    SELECT
+      art.*,
+      SAFE_DIVIDE(
+        (
+          art.dealer_margin - global.global_product_margin_mean
+        ),
+        global.global_product_margin_stddev
+      ) AS z_score_vs_global_margin,
+      ABS(
+        SAFE_DIVIDE(
+          (
+            art.dealer_margin - global.global_product_margin_mean
+          ),
+          global.global_product_margin_stddev
+        )
+      ) AS abs_z_score_vs_global_margin,
+      SAFE_DIVIDE(
+        (
+          art.dealer_margin - peer.global_product_margin_mean
+        ),
+        peer.global_product_margin_stddev
+      ) AS z_score_vs_peer_margin,
+      ABS(
+        SAFE_DIVIDE(
+          (
+            art.dealer_margin - peer.global_product_margin_mean
+          ),
+          peer.global_product_margin_stddev
+        )
+      ) AS abs_z_score_vs_peer_margin
+    FROM
+      `demo-project.demo_reporting.art_reporting` AS art
+      LEFT JOIN global_product_margin_means_stddevs AS global ON art.product_key = global.product_key
+      LEFT JOIN peer_product_margin_means_stddevs AS peer ON art.product_key = peer.product_key
+      AND art.peer_segmentation = peer.peer_segmentation
+    WHERE
+      dealer_pos_units >= 10
+      AND pos_asp >= 500
+      AND dealer_margin > 0
+  )
+SELECT
+  *
+FROM
+  assertion_z_score_calc
+WHERE
+  abs_z_score_vs_global_margin >= 5
+  AND abs_z_score_vs_peer_margin >= 5
+ORDER BY
+  abs_z_score_vs_global_margin DESC
